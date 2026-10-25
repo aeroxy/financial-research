@@ -1,0 +1,11 @@
+schema_version: "1.1"
+name: att-friday-drop
+expected_outcome: |
+  Asked on Sunday 2026-10-25, so friday is 2026-10-23. AT&T (T) closed down 7.96% at $20.93 on about twice its
+  normal volume. The main cause was a Bloomberg report, public before the open, that SpaceX is negotiating
+  access to roughly 80,000 US cell sites to turn Starlink Mobile into a nationwide wireless carrier. AT&T
+  gapped down about 4.4% at the open and kept sliding. T-Mobile fell 7.7% and Verizon 1.2% while the S&P 500
+  fell 0.5%, so it was a wireless-carrier story, not a market one. Context: AT&T had dropped 6.4% on Wednesday
+  2026-10-21 after its Q3 results, several brokers cut price targets on 2026-10-22, and a SpaceX spectrum deal
+  had hit the stock on 2026-10-09. A good answer leads with the cause, backs it with numbers and timing, labels
+  the SpaceX talks as reported rather than confirmed, and links its sources.

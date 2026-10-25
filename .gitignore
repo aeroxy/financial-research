@@ -1,0 +1,9 @@
+# Python bytecode from running the skill's script
+__pycache__/
+
+# Skill test runs: answers, grades and timings, regenerated each round of testing
+financial-research-workspace/
+
+# Per-machine files
+.DS_Store
+.claude/settings.local.json

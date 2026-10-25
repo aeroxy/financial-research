@@ -1,0 +1,11 @@
+schema_version: "1.1"
+name: sg-banks-valuation
+expected_outcome: |
+  Asked on 2026-10-25, using market data from the week ending 2026-10-23. Roughly: DBS price-to-book about 3.1,
+  ROE about 16%, dividend yield about 4.3%; OCBC P/B about 2.1, ROE about 12.7%, yield about 3.2%; UOB P/B
+  about 1.4, ROE about 9.2%, yield about 4.2%. Fundamentals come from 2Q26 / first-half 2026 results, and 3Q26
+  results are due 4-6 November 2026. Cheapness should be judged against profitability: UOB is cheapest on P/B
+  but also earns the lowest ROE, while DBS's premium reflects the highest ROE. Yahoo's trailing P/E figures for
+  UOB (7.4) and DBS (12.5) are inconsistent with their P/B and ROE, so a careful answer cross-checks them
+  against the banks' own results. A good answer covers capital strength or capital return, answers the question
+  directly without a buy/sell call, and links its sources.

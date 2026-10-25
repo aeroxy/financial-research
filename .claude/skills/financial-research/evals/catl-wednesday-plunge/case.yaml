@@ -1,0 +1,13 @@
+schema_version: "1.1"
+name: catl-wednesday-plunge
+expected_outcome: |
+  Asked on Sunday 2026-10-25, so wednesday is 2026-10-21. CATL's Shenzhen A-shares (300750.SZ) fell 12.03% to
+  CNY 227.90 on 3.4 times normal volume, and its Hong Kong H-shares (3750.HK) fell 11.4%. The cause was its Q3
+  2026 results, released after the close on Tuesday 2026-10-20: net profit attributable to shareholders rose
+  14.5% year on year to RMB 21.25 billion (about US$3.16 billion), its slowest growth in nearly two years and
+  down about 5.8% from Q2, while revenue rose 58.6% to RMB 165.2 billion. Gross margin narrowed (22.7% for nine
+  months against 25.3% a year earlier) amid intensifying competition. The selloff was mainly CATL-specific: the
+  Shenzhen Component index fell 0.8% and BYD 2.3%, though commentators worried about read-across to other
+  battery makers. A good answer gives the numbers, the timing (results after the close, drop the next session),
+  a same-day comparison with the market and peers, a direct answer to the sector question, and links its
+  sources.

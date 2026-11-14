@@ -1,6 +1,6 @@
 ---
 name: financial-research
-description: Explain why a stock, ETF, index or crypto pair moved, and research listed companies, across the US, Asia (Singapore, Hong Kong, Japan, Korea, Taiwan, mainland China, India) and Binance crypto. Use this whenever someone asks why a share price or coin rose, fell, crashed, pumped, spiked or "is down X% today/on Friday", what happened to a ticker, token or company this week, what Binance's AI says about a pair, or wants company research such as an earnings recap, beat/miss against consensus, guidance changes, what a filing or exchange announcement says, analyst rating changes, or a valuation/peer comparison, even if they only give a company name or ticker and a vague time like "today" or "after earnings".
+description: Explain why a stock, ETF, index or crypto pair moved, and research listed companies, across the US, Asia (Singapore, Hong Kong, Japan, Korea, Taiwan, mainland China, India) and Binance crypto. Use this whenever someone asks why a share price or coin rose, fell, crashed, pumped, spiked or "is down X% today/on Friday", what happened to a ticker, token or company this week, what Binance's AI says about a pair, or wants company research such as an earnings recap, beat/miss against consensus, guidance changes, what a filing or exchange announcement says, analyst rating changes, or a valuation/peer comparison, or what prediction markets (Kalshi, Polymarket) price for an event such as a Fed decision, CPI print, tariff or election, even if they only give a company name or ticker and a vague time like "today" or "after earnings".
 ---
 
 # Financial research
@@ -18,6 +18,7 @@ The goal is an answer a skeptical analyst would accept: numbers checked against 
 | `filings SYM --from D --to D` | US: SEC filings with exact acceptance times, 8-K item names and exhibit links. Asia: exchange announcements where a feed is wired up (see `references/markets.md`). Crypto: Binance listing, delisting, maintenance, news and airdrop notices that mention the token. |
 | `profile SYM [SYM ...]` | Valuation, growth, margins and consensus as a side-by-side table. With one symbol it adds EPS actual vs estimate and the latest analyst actions. Companies only. |
 | `binance-ai PAIR` | Binance's own AI report on a crypto pair (TL;DR, key drivers, risks) with its timestamp, the same as the "Insights" panel on the pair's binance.com trade page. It covers only the latest window, and Binance says it may be inaccurate, so use its drivers as leads to verify, never as the answer on their own. |
+| `odds "QUERY" [--date D]` | Kalshi and Polymarket prices on an event, as implied probabilities: Fed decisions, CPI and jobs prints, tariffs, shutdowns, elections, and some company questions (Tesla deliveries, what a CEO says on the call). Each market shows its mid-quote, 1-day change, volume and depth, flagged `THIN` when the price is unreliable. `--date` adds how each market moved that day and its largest step between hourly readings, including markets that have since settled (US time by default; `--market` changes it). Matching is by keyword, so try two phrasings ("fed decision", "fed rate"). Coverage is US-centric, with little on Asian stocks. |
 
 Other tools for reading and searching:
 - **Read an article or page:** `tinyfish fetch content get "<url>"` returns clean markdown with title, author and publish time, and it follows Google News redirect links. Moomoo and Futu articles (`moomoo.com/news/post/...`) read in full this way. Moomoo's stock and quote pages block scripts, so don't try those. If a page comes back empty or blocked, try `lightpanda fetch --dump markdown "<url>"`.
@@ -49,6 +50,7 @@ Pick 2–4 comparisons yourself, because Yahoo's "similar stocks" are often unre
 - Broker actions outside the US: Yahoo tracks US analyst actions only. For Asian stocks, run `fin.py news "<company> downgrade OR upgrade OR target price"` over the two sessions before the move as well as the day itself. A downgrade the day before often explains a weak open.
 - Sector: if peers moved too, search the competitor, regulator or industry story (`fin.py news "<industry or rival>"`).
 - Macro: if the benchmark moved more than ~1%, look at that day's macro news: central banks, inflation, jobs data, tariffs, geopolitics, and for Asia, the overnight US session.
+- Event odds: when a scheduled or political event is a candidate, run `fin.py odds "<event>" --date D` and check whether the odds jumped in the same hour as the price. On a CPI day, a 20-point swing in the Fed-decision market at 08:30 ties a rate-sensitive selloff to the print; odds that didn't move argue against that cause. This is market evidence of timing and scope, like a peer's move, not a source that names the cause.
 - Crypto: compare the coin with BTC first; most altcoin days are BTC days. Then check:
   - Binance's notices (`fin.py filings PAIR`).
   - The futures line: funding and open interest show whether leverage drove the move.
@@ -65,6 +67,10 @@ Pick 2–4 comparisons yourself, because Yahoo's "similar stocks" are often unre
 4. at least two independent sources tie the move to it.
 
 Keep three labels apart: **confirmed** (filing, company or regulator statement), **reported** ("according to Bloomberg", not confirmed by the parties) and **commentary** (analysts' or writers' interpretation). If nothing convincing turns up, say so. Then offer the remaining hypotheses (sympathy move, index rebalance, options expiry, follow-through from an earlier event) as hypotheses.
+
+## What the market expects
+
+For "what are the odds of X" or "what's priced in for X", run `fin.py odds "<event>"` without a date. Report the probability with its 1-day change and how deep the market is, and say where Kalshi and Polymarket agree or differ. Odds are the crowd's view of the event, not a forecast of any stock: if the user asks what it means for a stock, say which way the stock tends to react to that outcome and how much is already priced in, without making a call.
 
 ## Company research
 
@@ -97,6 +103,7 @@ Match the length to the question. A quick "why is X down today" during trading h
 - **Mismatched sources.** A recap that quotes numbers from a different quarter or share class is a common error. Check the period and the security.
 - **Date mismatches.** Aggregators sometimes stamp syndicated stories with the re-publish time. When timing matters, use the original outlet's timestamp.
 - **Missing data.** A source that failed, timed out or sat behind a paywall is not evidence that nothing happened. Say which source you couldn't check.
+- **Prediction markets.** A `THIN` price is noise. The last trade in a thin market can go stale for weeks, as when Kalshi showed 83% for "Fed above 5.50%" beside 23% for "above 5.00%". Lean on deep markets and on changes rather than levels. Labels are the venue's own wording, so read the market's title before quoting it.
 - **Insider filings.** Form 4s are filed up to two business days after the trade, so a sale just before a drop may only show up later.
 - **Citations.** Cite only sources you actually read and relied on, not every headline the search returned.
 - **Recommendations.** Don't give one unless asked. If asked which looks cheaper or better, give the analytical comparison and its caveats, not a call.

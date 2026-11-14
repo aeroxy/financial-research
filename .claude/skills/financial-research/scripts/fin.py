@@ -6,6 +6,7 @@
   fin.py filings SYMBOL [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--forms 8-K,10-Q]
   fin.py profile SYMBOL [SYMBOL ...]
   fin.py binance-ai PAIR
+  fin.py odds "QUERY" [--date YYYY-MM-DD] [--market us|sg|...] [-n 4]
 
 Symbols are Yahoo Finance tickers: T, D05.SI, 0700.HK, 7203.T, 005930.KS, 2330.TW, 600519.SS, RELIANCE.NS.
 Crypto pairs come from Binance: BTCUSDT or BTC/USDT (USDT, USDC and FDUSD quotes; others need the slash, ETH/BTC).
@@ -21,11 +22,13 @@ import os
 import re
 import statistics
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
@@ -724,6 +727,198 @@ def cmd_profile(a):
                       f"{'  target ' + str(h['currentPriceTarget']) if h.get('currentPriceTarget') else ''}")
 
 
+# --- prediction markets ----------------------------------------------------------------------
+# Each venue becomes a list of events (title, url, contracts). A contract is one yes/no market as a dict whose prices
+# are dollars per $1 payout, i.e. implied probabilities. depth is Kalshi open interest (contracts) or Polymarket
+# order-book liquidity (USD); vol24 and vol (lifetime) pick the markets worth showing.
+
+KALSHI = "https://api.elections.kalshi.com"
+MAX_CONTRACTS = 8
+
+
+def fnum(x):
+    return None if x in (None, "") else float(x)
+
+
+def iso(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")) if s else None
+
+
+def implied(bid, ask, last):
+    """The mid-quote, or the last trade when the quote is one-sided or wider than 10¢ (Polymarket's own display rule).
+    Last trades go stale: Kalshi once showed 83% for 'Fed above 5.50%' beside 23% for 'above 5.00%'."""
+    if bid and ask and bid < ask < 1 and ask - bid <= 0.10:  # Kalshi shows a missing bid as 0 and ask as 1
+        return (bid + ask) / 2
+    return None if last is None else min(max(last, bid or 0), ask or 1)  # nobody pays above the ask or sells below the bid
+
+
+def open_during(c, window):
+    return (c["opened"] is None or c["opened"] < window[1]) and (c["closed"] is None or c["closed"] >= window[0])
+
+
+def kalshi_history(series, ticker, t0, t1):
+    d = get_json(f"{KALSHI}/trade-api/v2/series/{series}/markets/{ticker}/candlesticks"
+                 f"?start_ts={t0}&end_ts={t1}&period_interval=60")
+    path = [(c["end_period_ts"], implied(fnum(c["yes_bid"].get("close_dollars")), fnum(c["yes_ask"].get("close_dollars")),
+                                         fnum(c["price"].get("close_dollars")))) for c in d.get("candlesticks") or []]
+    return [(t, p) for t, p in path if p is not None]
+
+
+def kalshi_contract(series, m):
+    bid, ask, last = (fnum(m.get(k + "_dollars")) for k in ("yes_bid", "yes_ask", "last_price"))
+    p = implied(bid, ask, last)
+    prev = implied(*(fnum(m.get(k + "_dollars")) for k in ("previous_yes_bid", "previous_yes_ask", "previous_price")))
+    return {"label": m.get("yes_sub_title") or m["title"], "order": fnum(m.get("floor_strike")), "p": p, "bid": bid,
+            "ask": ask, "chg1d": None if p is None or prev is None else p - prev,
+            "vol24": fnum(m.get("volume_24h_fp")), "depth": fnum(m.get("open_interest_fp")),
+            "vol": fnum(m.get("volume_fp")) or 0, "opened": iso(m.get("open_time")), "closed": iso(m.get("close_time")),
+            "result": m.get("result") or None,
+            "history": lambda t0, t1: kalshi_history(series, m["ticker"], t0, t1)}
+
+
+def kalshi_contracts(event_ticker):
+    d = get_json(f"{KALSHI}/trade-api/v2/events/{event_ticker}?with_nested_markets=true")
+    ev = d["event"]
+    return [kalshi_contract(ev["series_ticker"], m) for m in d.get("markets") or ev.get("markets") or []]
+
+
+def kalshi_events(query, window):
+    """(title, url, first close, loader) per event. The full market data costs a call per event, so it loads later."""
+    # The trade API has no text search, so use the one behind kalshi.com (undocumented). Without a status it returns
+    # open events only; a past date also needs settled ones. (status=closed, for the hours between closing and
+    # settling, returns mostly unrelated events.)
+    found = {}
+    for status in [None] + (["settled"] if window else []):
+        q = {"query": query, "page_size": 20, **({"status": status} if status else {})}
+        for e in get_json(f"{KALSHI}/v1/search/series?" + urllib.parse.urlencode(q))["current_page"]:
+            if e.get("event_ticker"):
+                found.setdefault(e["event_ticker"], e)
+    for ticker, e in found.items():
+        closes = [iso(m["close_ts"]) for m in e.get("markets") or [] if not window or
+                  open_during({"opened": iso(m.get("open_ts")), "closed": iso(m.get("close_ts"))}, window)]
+        if closes:
+            yield (e["event_title"] + (f" ({e['event_subtitle']})" if e.get("event_subtitle") else ""),
+                   f"https://kalshi.com/markets/{e['series_ticker'].lower()}", min(closes),
+                   lambda t=ticker: kalshi_contracts(t))
+
+
+def poly_history(token, t0, t1):
+    d = get_json(f"https://clob.polymarket.com/prices-history?market={token}&startTs={t0}&endTs={t1}&fidelity=60")
+    return [(x["t"], x["p"]) for x in d.get("history") or []]
+
+
+def poly_contract(m):
+    bid, ask, last = fnum(m.get("bestBid")), fnum(m.get("bestAsk")), fnum(m.get("lastTradePrice"))
+    outcomes, payouts = json.loads(m.get("outcomes") or "[]"), json.loads(m.get("outcomePrices") or "[]")
+    tokens = json.loads(m.get("clobTokenIds") or "[]")
+    label = m.get("groupItemTitle") or m["question"]
+    if outcomes and outcomes[0] != "Yes":  # e.g. Up/Down or two team names: the price is for the first outcome
+        label += f" ({outcomes[0]})"
+    return {"label": label, "order": fnum(m.get("groupItemThreshold")), "p": implied(bid, ask, last), "bid": bid,
+            "ask": ask, "chg1d": fnum(m.get("oneDayPriceChange")), "vol24": fnum(m.get("volume24hr")),
+            "depth": fnum(m.get("liquidityNum")), "vol": fnum(m.get("volumeNum")) or 0,
+            "opened": iso(m.get("startDate")), "closed": iso(m.get("closedTime") or m.get("endDate")),
+            "result": outcomes[payouts.index("1")] if m.get("closed") and "1" in payouts else None,
+            "history": lambda t0, t1: poly_history(tokens[0], t0, t1) if tokens else []}
+
+
+def poly_events(query, window):
+    q = {"q": query, "limit_per_type": 20, **({} if window else {"events_status": "active"})}
+    for e in get_json("https://gamma-api.polymarket.com/public-search?" + urllib.parse.urlencode(q)).get("events") or []:
+        cs = [poly_contract(m) for m in e.get("markets") or [] if window or not m.get("closed")]
+        yield e["title"], f"https://polymarket.com/event/{e['slug']}", iso(e.get("endDate")), lambda cs=cs: cs
+
+
+def thin(c):
+    """Why a price shouldn't be read as a forecast. A missing quote is normal near 0% or 100%."""
+    bid, ask = c["bid"] or 0, c["ask"] or 1
+    why = []
+    if bid and ask < 1:
+        if ask - bid > 0.05:
+            why.append(f"{(ask - bid) * 100:.0f}¢ spread")
+    elif c["p"] is None or 0.05 < c["p"] < 0.95:
+        why.append("one-sided quote")
+    if (c["depth"] or 0) < 1000:
+        why.append("depth under 1K")
+    return why
+
+
+def day_move(c, window, tz):
+    t0, t1 = (int(t.timestamp()) for t in window)
+    now = int(datetime.now(timezone.utc).timestamp())
+    day = f"{window[0]:%a %Y-%m-%d}"
+    for attempt in (1, 2):
+        try:
+            hist = c["history"](t0 - 86_400, min(t1, now))
+            break
+        except urllib.error.URLError as e:
+            if attempt == 1 and getattr(e, "code", None) == 429:  # Kalshi allows ~20 reads a second
+                time.sleep(1)
+                continue
+            return f"{day}: no history ({getattr(e, 'reason', e)})"
+    path = [x for x in hist if x[0] <= t0][-1:] + [x for x in hist if t0 < x[0] <= t1]
+    if len(path) < 2:
+        return f"{day}: no readings that day"
+    (ta, pa), (tb, pb) = max(zip(path, path[1:]), key=lambda s: abs(s[1][1] - s[0][1]))
+    hm = lambda t: f"{datetime.fromtimestamp(t, tz):%H:%M}"
+    return (f"{day}: {path[0][1]:.1%} → {path[-1][1]:.1%} ({(path[-1][1] - path[0][1]) * 100:+.1f} pts)"
+            f"{' so far' if t1 > now else ''}"
+            f"{f' · largest step {hm(ta)}→{hm(tb)} {(pb - pa) * 100:+.1f} pts' if abs(pb - pa) >= 0.005 else ''}")
+
+
+def cmd_odds(a):
+    tz = ZoneInfo(MARKETS[a.market].tz)
+    window = None
+    if a.date:
+        start = datetime.combine(date.fromisoformat(a.date), datetime.min.time(), tz)
+        window = (start, start + timedelta(days=1))
+    print(f'Prediction-market odds for "{a.query}", times {tz.key}. Prices are implied probabilities: the mid-quote,'
+          " or the last trade when the quote is one-sided or wider than 10¢.\nTHIN marks prices to discount:"
+          " a wide or one-sided quote, or little money behind it.")
+    for venue, fetch, depth_name in (("Kalshi", kalshi_events, "open interest {}"),
+                                     ("Polymarket", poly_events, "liquidity ${}")):
+        events = []
+        try:
+            found = list(fetch(a.query, window))
+            if window:  # the question resolving soonest after that day is usually the one being priced
+                found.sort(key=lambda e: (e[2] or datetime.max.replace(tzinfo=timezone.utc)).astimezone(tz).date())
+            for title, url, _, load in found:
+                cs = [c for c in load() if c["vol"] and (not window or open_during(c, window))]
+                if cs:
+                    events.append((title, url, cs))
+                if len(events) == a.n:
+                    break
+        except urllib.error.URLError as e:  # one venue down shouldn't hide the other
+            print(f"\n-- {venue}: unreachable ({getattr(e, 'reason', e)})")
+            continue
+        print(f"\n-- {venue}: {len(events) or 'no'} matching event(s){' open that day' if window else ''}")
+        for title, url, cs in events:
+            print(f"{title}  {url}")
+            # What trades today, then what traded most ever: lifetime volume alone surfaces long-dead outcomes.
+            shown = sorted(sorted(cs, key=lambda c: (-(c["vol24"] or 0), -c["vol"]))[:MAX_CONTRACTS],
+                           key=lambda c: (c["order"] is None, c["order"] or 0, -(c["p"] or 0)))
+            with ThreadPoolExecutor(4) as pool:
+                moves = list(pool.map(lambda c: day_move(c, window, tz), shown)) if window else []
+            for k, c in enumerate(shown):
+                if c["result"]:
+                    line = f"settled: {c['result']}"
+                elif c["p"] is None:
+                    line = "no price"
+                else:
+                    quote = "/".join(f"{x * 100:g}" if x and x < 1 else "–" for x in (c["bid"], c["ask"]))
+                    why = thin(c)
+                    line = "  ".join(x for x in (
+                        f"{'now ' if window else ''}{c['p']:>6.1%}", f"bid/ask {quote}¢",
+                        f"1d {c['chg1d'] * 100:+.1f} pts" if c["chg1d"] is not None else "",
+                        f"24h vol {human(c['vol24'])}" if c["vol24"] else "",
+                        depth_name.format(human(c["depth"] or 0)), f"THIN: {', '.join(why)}" if why else "") if x)
+                print(f"  {c['label']:<34} {line}")
+                if window:
+                    print(f"  {'':<34}   {moves[k]}")
+            if len(cs) > len(shown):
+                print(f"  (+{len(cs) - len(shown)} less-traded markets not shown)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -750,10 +945,15 @@ def main():
     p.add_argument("symbols", nargs="+")
     b = sub.add_parser("binance-ai", help="Binance's AI report (TL;DR, drivers, risks) for a crypto pair")
     b.add_argument("symbol", help="BNBUSDT, BNB/USDT or just BNB")
+    o = sub.add_parser("odds", help="Kalshi and Polymarket odds on an event (Fed, CPI, tariffs, elections, a company)")
+    o.add_argument("query", help='a few keywords, e.g. "fed rate", "cpi", "tariff", "shutdown", "tesla deliveries"')
+    o.add_argument("--date", help="YYYY-MM-DD: how the odds moved that day, including markets since closed")
+    o.add_argument("--market", choices=MARKETS, default="us", help="timezone for --date and times (default us)")
+    o.add_argument("-n", type=int, default=4, help="max events per venue (default 4)")
     a = ap.parse_args()
     try:
         {"move": cmd_move, "news": cmd_news, "filings": cmd_filings, "profile": cmd_profile,
-         "binance-ai": cmd_binance_ai}[a.cmd](a)
+         "binance-ai": cmd_binance_ai, "odds": cmd_odds}[a.cmd](a)
     except LookupError as e:
         sys.exit(str(e))
     except urllib.error.HTTPError as e:

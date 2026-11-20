@@ -5,21 +5,26 @@
   fin.py news "QUERY" [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--market us|sg|hk|jp|kr|tw|cn|in|crypto] [--local] [--symbol SYM]
   fin.py filings SYMBOL [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--forms 8-K,10-Q]
   fin.py profile SYMBOL [SYMBOL ...]
-  fin.py binance-ai PAIR
+  fin.py binance-ai PAIR [--at "YYYY-MM-DD HH:MM"]
   fin.py odds "QUERY" [--date YYYY-MM-DD] [--market us|sg|...] [-n 4]
 
-Symbols are Yahoo Finance tickers: T, D05.SI, 0700.HK, 7203.T, 005930.KS, 2330.TW, 600519.SS, RELIANCE.NS.
+Symbols are Yahoo Finance tickers: T, D05.SI, 0700.HK, 7203.T, 005930.KS, 2330.TW, 600519.SS, RELIANCE.NS, ^GSPC.
 Crypto pairs come from Binance: BTCUSDT or BTC/USDT (USDT, USDC and FDUSD quotes; others need the slash, ETH/BTC).
+Stock prices come from moomoo (US, Hong Kong and Singapore, with an AppKey in MOOMOO_CONFIG), then CNBC, then Yahoo.
 Behind a TLS-inspecting proxy, set SSL_CERT_FILE to the proxy's CA certificate.
 SEC asks API users to identify themselves: set SEC_USER_AGENT="Your Name you@example.com".
 """
 import argparse
+import base64
+import functools
 import gzip
+import hashlib
 import html
 import http.cookiejar
 import json
 import os
 import re
+import secrets
 import statistics
 import sys
 import time
@@ -33,23 +38,42 @@ from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
-BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+# Every request looks like Firefox opening a page, the same for every source: sites can be stricter with clients
+# that don't look like a browser. Only gzip is offered because only gzip is decoded here.
+BROWSER = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:160.0) Gecko/20100101 Firefox/160.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Priority": "u=0, i",
+    "Pragma": "no-cache",
+    "Cache-Control": "no-cache",
+}
 SEC_UA = os.environ.get("SEC_USER_AGENT", "financial-research-skill research@example.com")
 
-# Google News locales are (hl, gl, ceid).
-Market = namedtuple("Market", "benchmark tz news_en news_local")
+# Google News locales are (hl, gl, ceid). Hours are the regular session in local time, closing auction included.
+Market = namedtuple("Market", "benchmark tz hours news_en news_local")
 MARKETS = {
-    "us": Market("^GSPC", "America/New_York", ("en-US", "US", "US:en"), None),
-    "sg": Market("^STI", "Asia/Singapore", ("en-SG", "SG", "SG:en"), None),
-    "hk": Market("^HSI", "Asia/Hong_Kong", ("en-HK", "HK", "HK:en"), ("zh-HK", "HK", "HK:zh-Hant")),
-    "jp": Market("^N225", "Asia/Tokyo", ("en-US", "US", "US:en"), ("ja", "JP", "JP:ja")),
-    "kr": Market("^KS11", "Asia/Seoul", ("en-US", "US", "US:en"), ("ko", "KR", "KR:ko")),
-    "tw": Market("^TWII", "Asia/Taipei", ("en-US", "US", "US:en"), ("zh-TW", "TW", "TW:zh-Hant")),
-    "cn": Market("000001.SS", "Asia/Shanghai", ("en-US", "US", "US:en"), ("zh-CN", "CN", "CN:zh-Hans")),
-    "in": Market("^NSEI", "Asia/Kolkata", ("en-IN", "IN", "IN:en"), None),
-    "crypto": Market("BTCUSDT", "UTC", ("en-US", "US", "US:en"), None),
+    "us": Market("^GSPC", "America/New_York", ("09:30", "16:00"), ("en-US", "US", "US:en"), None),
+    "sg": Market("^STI", "Asia/Singapore", ("09:00", "17:06"), ("en-SG", "SG", "SG:en"), None),
+    "hk": Market("^HSI", "Asia/Hong_Kong", ("09:30", "16:10"), ("en-HK", "HK", "HK:en"),
+                 ("zh-HK", "HK", "HK:zh-Hant")),
+    "jp": Market("^N225", "Asia/Tokyo", ("09:00", "15:30"), ("en-US", "US", "US:en"), ("ja", "JP", "JP:ja")),
+    "kr": Market("^KS11", "Asia/Seoul", ("09:00", "15:30"), ("en-US", "US", "US:en"), ("ko", "KR", "KR:ko")),
+    "tw": Market("^TWII", "Asia/Taipei", ("09:00", "13:30"), ("en-US", "US", "US:en"),
+                 ("zh-TW", "TW", "TW:zh-Hant")),
+    "cn": Market("000001.SS", "Asia/Shanghai", ("09:30", "15:00"), ("en-US", "US", "US:en"),
+                 ("zh-CN", "CN", "CN:zh-Hans")),
+    "in": Market("^NSEI", "Asia/Kolkata", ("09:15", "15:30"), ("en-IN", "IN", "IN:en"), None),
+    "crypto": Market("BTCUSDT", "UTC", ("00:00", "24:00"), ("en-US", "US", "US:en"), None),
 }
+# Indices without a suffix that belong to a market other than the US.
+INDEX_MARKET = {"^STI": "sg", "^HSI": "hk", "^N225": "jp", "^TOPX": "jp", "^KS11": "kr", "^KQ11": "kr", "^TWII": "tw",
+                "^NSEI": "in"}
 CRYPTO_QUOTES = ("USDT", "USDC", "FDUSD")
 BINANCE_CATALOGS = {48: "listing", 161: "delisting", 157: "maintenance", 49: "news", 128: "airdrop"}
 AI_SECTIONS = {"tldr": "TL;DR", "key_drivers": "Key drivers", "risk_assessment": "Risks"}
@@ -85,8 +109,7 @@ _crumb = None
 
 
 def get(url, headers=None, data=None):
-    req = urllib.request.Request(url, data=data, headers={"User-Agent": BROWSER_UA, "Accept-Encoding": "gzip",
-                                                          **(headers or {})})
+    req = urllib.request.Request(url, data=data, headers={**BROWSER, **(headers or {})})
     try:
         with _opener.open(req, timeout=30) as r:
             body = r.read()
@@ -136,6 +159,8 @@ def crypto_pair(symbol):
 def market_of(symbol):
     if crypto_pair(symbol):
         return "crypto"
+    if symbol in INDEX_MARKET:
+        return INDEX_MARKET[symbol]
     return SUFFIX_MARKET.get(symbol.rsplit(".", 1)[-1] if "." in symbol else "", "us")
 
 
@@ -143,10 +168,289 @@ def benchmark_of(symbol):
     pair = crypto_pair(symbol)
     if pair:
         return "ETHUSDT" if pair[0] == "BTC" else "BTCUSDT"
-    return SUFFIX_BENCHMARK.get(symbol.rsplit(".", 1)[-1], MARKETS[market_of(symbol)].benchmark)
+    bench = SUFFIX_BENCHMARK.get(symbol.rsplit(".", 1)[-1], MARKETS[market_of(symbol)].benchmark)
+    return "^GSPC" if bench == symbol else bench  # an Asian index follows the US session before it
+
+
+# --- prices ----------------------------------------------------------------------------------
+# Bars stamped in the exchange's own timezone, from the first source that has them: Binance for crypto pairs;
+# otherwise moomoo, CNBC, then Yahoo. A source returns (meta, bars, dividends), None when it doesn't cover the
+# symbol, or raises with its reason.
+
+def prices(symbol, start, end, interval="1d", prepost=False):
+    """meta["source"] names the source that answered, with why any before it failed."""
+    pair = crypto_pair(symbol)
+    if pair:
+        return binance_klines(*pair, start, end, interval)
+    failed = []
+    for name, source in (("moomoo", moomoo_bars), ("CNBC", cnbc_bars), ("Yahoo", chart)):
+        try:
+            got = source(symbol, start, end, interval, prepost)
+        except (LookupError, OSError, ValueError, KeyError) as e:
+            failed.append(f"{name}: {e}")
+            continue
+        if got:
+            got[0]["source"] = name + (f" ({'; '.join(failed)})" if failed else "")
+            return got
+    raise LookupError(f"No price data for {symbol}: {'; '.join(failed) or 'no source covers it'}.")
+
+
+# --- moomoo OpenAPI --------------------------------------------------------------------------
+# moomoo's REST API (open.moomoo.com) gives international accounts US, Hong Kong and Singapore stock data for free:
+# bars going back years (5-minute ones too, with US pre-market, after-hours and overnight trading), dividends and
+# splits, US analyst actions, consensus, valuation and estimates. It needs an AppKey, set up as
+# references/markets.md says, and every request is signed with the AppKey's Ed25519 key. The first time a symbol's
+# history is read it takes one of the account's history slots (about 100 on a small account) for 7 days; when they
+# run out, prices come from CNBC.
+
+MOOMOO_CONFIG = os.environ.get("MOOMOO_CONFIG", os.path.expanduser("~/.config/financial-research/moomoo.json"))
+MOOMOO_MARKETS = {"us": "US", "hk": "HK", "sg": "SG"}
+MOOMOO_ERRORS = {-7: "unknown symbol", -8: "not supported", -10: "no data",
+                 -12: "the history quota is used up (each new symbol holds a slot for 7 days)",
+                 -13: "its quota service is down", -12006: "it refused the signature (an expired AppKey, or this"
+                 " machine's clock more than 5 seconds off)", -12009: "the AppKey lacks permission for this"}
+ED25519_PKCS8 = bytes.fromhex("302e020100300506032b657004220420")  # a PKCS#8 Ed25519 key is this, then the seed
+
+# Ed25519 signing (RFC 8032), which the standard library lacks: point arithmetic in extended coordinates. Its
+# signatures are deterministic, and these match OpenSSL's byte for byte.
+ED_P = 2**255 - 19
+ED_L = 2**252 + 27742317777372353535851937790883648493
+ED_D = -121665 * pow(121666, ED_P - 2, ED_P) % ED_P
+ED_X = 15112221349535400772501151409588531511454012693041857206046113283949847762202
+ED_Y = 46316835694926478169428394003475163141307993866256225615783033603165251855960
+
+
+def ed_add(a, b):
+    (x1, y1, z1, t1), (x2, y2, z2, t2) = a, b
+    p, q = (y1 - x1) * (y2 - x2) % ED_P, (y1 + x1) * (y2 + x2) % ED_P
+    r, s = 2 * t1 * t2 * ED_D % ED_P, 2 * z1 * z2 % ED_P
+    e, f, g, h = q - p, s - r, s + r, q + p
+    return e * f % ED_P, g * h % ED_P, f * g % ED_P, e * h % ED_P
+
+
+def ed_mul(n, point):
+    acc = (0, 1, 1, 0)
+    while n:
+        if n & 1:
+            acc = ed_add(acc, point)
+        point, n = ed_add(point, point), n >> 1
+    return acc
+
+
+def ed_encode(point):
+    zi = pow(point[2], ED_P - 2, ED_P)
+    x, y = point[0] * zi % ED_P, point[1] * zi % ED_P
+    return (y | (x & 1) << 255).to_bytes(32, "little")
+
+
+def ed25519_sign(seed, msg):
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little") & (2**254 - 8) | 2**254
+    base = (ED_X, ED_Y, 1, ED_X * ED_Y % ED_P)
+    public = ed_encode(ed_mul(a, base))
+    r = int.from_bytes(hashlib.sha512(h[32:] + msg).digest(), "little") % ED_L
+    big_r = ed_encode(ed_mul(r, base))
+    k = int.from_bytes(hashlib.sha512(big_r + public + msg).digest(), "little") % ED_L
+    return big_r + ((r + k * a) % ED_L).to_bytes(32, "little")
+
+
+@functools.cache
+def moomoo_key():
+    """(AppKey, Ed25519 seed) from MOOMOO_CONFIG, None when there is no config, or why it can't be used."""
+    try:
+        with open(MOOMOO_CONFIG) as f:
+            cfg = json.load(f)
+        with open(os.path.join(os.path.dirname(MOOMOO_CONFIG), cfg["private_key"])) as f:
+            der = base64.b64decode("".join(x for x in f.read().splitlines() if not x.startswith("-----")))
+        expires = datetime.fromisoformat(cfg.get("expires") or "9999-12-31")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError) as e:
+        return f"can't read the AppKey config ({e})"
+    if (expires if expires.tzinfo else expires.replace(tzinfo=timezone.utc)) < datetime.now(timezone.utc):
+        return f"the AppKey expired on {expires:%Y-%m-%d}; make a new one at open.moomoo.com/dashboard"
+    if len(der) != 48 or der[:16] != ED25519_PKCS8:
+        return "the private key isn't an Ed25519 key in PKCS#8 PEM"
+    return cfg["app_key"], der[16:]
+
+
+def moomoo(path, query=None, body=None):
+    """One signed moomoo OpenAPI call: (data, pagination). Rate limits are waited out twice; any other refusal is a
+    LookupError with moomoo's reason."""
+    key = moomoo_key()
+    if not isinstance(key, tuple):
+        raise LookupError(key or "no AppKey set up (references/markets.md says how)")
+    qs = urllib.parse.urlencode(query or {})
+    raw = b"" if body is None else json.dumps(body).encode()
+    for attempt in range(3):
+        stamp = str(int(time.time() * 1000))
+        signed = f"{stamp}\n{'POST' if raw else 'GET'}\n{path}\n{qs}\n{hashlib.sha256(raw).hexdigest() if raw else ''}"
+        headers = {"X-Api-Key": key[0], "X-Timestamp": stamp, "X-Nonce": secrets.token_hex(8),
+                   "Authorization": base64.b64encode(ed25519_sign(key[1], signed.encode())).decode(),
+                   "Accept": "application/json", "Content-Type": "application/json"}
+        try:
+            d = get_json(f"https://webapi.moomoo.com{path}{'?' + qs if qs else ''}", headers=headers, data=raw or None)
+        except urllib.error.HTTPError as e:
+            text = e.read()
+            try:
+                d = json.loads(gzip.decompress(text) if e.headers.get("Content-Encoding") == "gzip" else text)
+            except ValueError:
+                raise LookupError(f"HTTP {e.code}") from None
+        code = d.get("ret_code", d.get("code"))
+        if code == 0:
+            return d.get("data") or {}, d.get("pagination") or {}
+        if code in (-11, -12011) and attempt < 2:  # rate-limited, or this symbol's slot is still being reserved
+            time.sleep(2)
+            continue
+        raise LookupError(MOOMOO_ERRORS.get(code) or f"{d.get('ret_msg') or d.get('message')} ({code})")
+
+
+def moomoo_symbol(symbol):
+    """US.NVDA, HK.00700 or SG.D05 for a Yahoo ticker; None elsewhere, and for indices (moomoo has no US ones)."""
+    mkt = market_of(symbol)
+    if mkt not in MOOMOO_MARKETS or symbol.startswith("^"):
+        return None
+    code = symbol.replace("-", ".") if mkt == "us" else symbol.rsplit(".", 1)[0]
+    return f"{MOOMOO_MARKETS[mkt]}.{code.zfill(5) if mkt == 'hk' else code}"
+
+
+def moomoo_klines(code, start, end, ktype, extended=0):
+    """Unadjusted bars between two dates in the market's timezone, oldest first. Minute bars stop before `end`."""
+    query = {"start": str(start), "end": str(end), "ktype": ktype, "autype": 0, "num": 370, "extended_time": extended}
+    rows = []
+    for _ in range(20):  # 20 pages of 370 bars; a request needing more is a mistake
+        data, page = moomoo(f"/api/v1.0/quote/{code}/history-kline", query)
+        # Each page reaches further back. A session in progress also lists its later bars, empty.
+        rows = [r for r in data.get("kline_list") or [] if r.get("close") is not None] + rows
+        if not page.get("has_more"):
+            break
+        token = page.get("next_page_token")
+        query = {**query, "page_token": token} if token else {**query, "next_time": data["next_time"]}
+    return rows
+
+
+def moomoo_bars(symbol, start, end, interval, prepost):
+    code = moomoo_symbol(symbol)
+    if not code or moomoo_key() is None:
+        return None
+    tz = ZoneInfo(MARKETS[market_of(symbol)].tz)
+    meta = {"exchangeTimezoneName": tz.key}
+    if interval != "1d":
+        rows = moomoo_klines(code, start, end, 6, 1 if code.startswith("US.") else 0)
+        if code.startswith("US."):
+            # extended_time=1 adds pre-market and after-hours, 2 the overnight session instead, so the bars both
+            # return are the regular session, early closes included.
+            night = moomoo_klines(code, start, end, 6, 2)
+            meta["regular"] = {k // 1000 - 300 for k in {r["time_key"] for r in rows} & {r["time_key"] for r in night}}
+            rows = sorted({r["time_key"]: r for r in rows + night}.values(), key=lambda r: r["time_key"])
+        if not rows:
+            raise LookupError(f"no 5-minute bars in {start}..{end}")
+        # moomoo stamps a bar with its end, the other sources with its start.
+        return meta, [Bar(datetime.fromtimestamp(r["time_key"] / 1000 - 300, tz), r["open"], r["high"], r["low"],
+                          r["close"], r["volume"]) for r in rows], {}
+    rows = moomoo_klines(code, start, end, 2)
+    if not rows:
+        raise LookupError(f"no bars in {start}..{end}")
+    bars = [Bar(datetime.strptime(str(r["date"]), "%Y%m%d").replace(tzinfo=tz), r["open"], r["high"], r["low"],
+                r["close"], r["volume"]) for r in rows]
+    # Raw prices put on today's share basis across splits, as Yahoo's are. Dividends stay in the prices, as on the
+    # exchange, and are listed for move to flag.
+    try:
+        events = moomoo(f"/api/v1.0/quote/{code}/corporate-actions/rehab", {"divi_mode": "exclude_divi"})[0]
+    except LookupError:
+        events = {}
+    divs = {}
+    for e in sorted(events.get("rehabs") or [], key=lambda e: e["ex_div_date"]):
+        ex = date.fromisoformat(e["ex_div_date"])
+        a, b = e.get("forward_adj_factorA", 1), e.get("forward_adj_factorB", 0)
+        if (a, b) != (1, 0):
+            bars = [Bar(x.t, *(a * p + b for p in x[1:5]), x.v / a) if x.t.date() < ex else x for x in bars]
+            divs = {d: v * a for d, v in divs.items()}
+        cash = (e.get("per_cash_div") or 0) + (e.get("special_dividend") or 0)
+        if cash:
+            divs[ex] = divs.get(ex, 0) + cash
+    return {**meta, "longName": rows[-1].get("name"), **quote_meta(cnbc_quote(symbol))}, bars, divs
+
+
+# --- CNBC ------------------------------------------------------------------------------------
+# The chart and quote APIs behind cnbc.com (undocumented, keyless): daily and 5-minute bars for indices and for
+# stocks in most markets, and a quote that names the security. US 5-minute bars include pre-market and after-hours.
+# Closes are split-adjusted only, like Yahoo's. Daily bars for Asian stocks lag a session behind the quote, so the
+# latest session comes from the quote. Not covered: most Japanese stocks, KOSDAQ and Taiwan's OTC market.
+
+CNBC_INDEX = {"^GSPC": ".SPX", "^IXIC": ".IXIC", "^DJI": ".DJI", "^RUT": ".RUT", "^VIX": ".VIX", "^SOX": ".SOX",
+              "^STI": ".STI", "^HSI": ".HSI", "^N225": ".N225", "^TOPX": ".TOPX", "^KS11": ".KS11", "^KQ11": ".KQ11",
+              "^TWII": ".TWII",
+              "000001.SS": ".SSEC", "399001.SZ": ".SZI", "^NSEI": ".NSEI"}
+CNBC_SUFFIX = {"SI": "SG", "HK": "HK", "T": "JP", "KS": "KR", "TW": "TW", "SS": "CN", "SZ": "CN", "NS": "IN"}
+
+
+def cnbc_symbol(symbol):
+    if symbol.startswith("^") or symbol in CNBC_INDEX:
+        return CNBC_INDEX.get(symbol)
+    if market_of(symbol) == "us":
+        return symbol.replace("-", ".")
+    code, _, suffix = symbol.rpartition(".")
+    return f"{code.lstrip('0') if suffix == 'HK' else code}-{CNBC_SUFFIX[suffix]}" if suffix in CNBC_SUFFIX else None
+
+
+def cnbc_quote(symbol):
+    """CNBC's quote for a ticker, {} when it has none."""
+    sym = cnbc_symbol(symbol)
+    try:
+        q = get_json("https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol?"
+                     + urllib.parse.urlencode({"symbols": sym, "requestMethod": "itv", "noform": 1, "partnerId": 2,
+                                               "fund": 1, "exthrs": 1, "output": "json"})
+                     )["FormattedQuoteResult"]["FormattedQuote"] if sym else {}
+    except (OSError, ValueError, KeyError):
+        return {}
+    q = q[0] if isinstance(q, list) else q
+    return q if q.get("code") == 0 else {}
+
+
+def quote_meta(q):
+    return {k: q[f] for k, f in (("longName", "name"), ("fullExchangeName", "exchange"), ("currency", "currencyCode"))
+            if q.get(f)}
+
+
+def cnbc_number(s):
+    return float(str(s).replace(",", ""))
+
+
+def cnbc_bars(symbol, start, end, interval, prepost):
+    sym = cnbc_symbol(symbol)
+    if not sym:
+        return None
+    d = get_json(f"https://ts-api.cnbc.com/harmony/app/bars/{urllib.parse.quote(sym)}"
+                 f"/{'1D' if interval == '1d' else '5M'}/{start:%Y%m%d}000000/{end:%Y%m%d}000000/adjusted/EST5EDT.json")
+    rows = (d.get("barData") or {}).get("priceBars") or []
+    if not rows:
+        raise LookupError(f"no bars for {sym}")
+    tz = ZoneInfo(MARKETS[market_of(symbol)].tz)
+    stamp = ((lambda r: datetime.strptime(r["tradeTime"][:8], "%Y%m%d").replace(tzinfo=tz)) if interval == "1d"
+             else (lambda r: datetime.fromtimestamp(r["tradeTimeinMills"] / 1000, tz)))
+    bars = [Bar(stamp(r), *(cnbc_number(r[k]) for k in ("open", "high", "low", "close")), cnbc_number(r["volume"] or 0))
+            for r in rows]
+    q = cnbc_quote(symbol)
+    if interval == "1d" and q.get("last_time"):
+        day = datetime.strptime(q["last_time"], "%Y-%m-%dT%H:%M:%S.%f%z").astimezone(tz).date()
+        try:
+            latest = [cnbc_number(q[k]) for k in ("open", "high", "low", "last")] + [cnbc_number(q.get("volume") or 0)]
+        except (KeyError, ValueError):
+            latest = None
+        if latest and bars[-1].t.date() < day <= end:
+            bars.append(Bar(datetime.combine(day, datetime.min.time(), tz), *latest))
+    return {"exchangeTimezoneName": tz.key, **quote_meta(q)}, bars, {}
 
 
 # --- Yahoo Finance ---------------------------------------------------------------------------
+# Yahoo answers most scripted requests with HTTP 429 now, so it comes last.
+
+def yahoo_error(e):
+    return {404: "doesn't know the ticker (HTTP 404); check its suffix",
+            429: "refuses this machine's requests (HTTP 429), which says nothing about the ticker"}.get(
+        e.code, f"answered HTTP {e.code}")
+
 
 def chart(symbol, start, end, interval="1d", prepost=False):
     """Bars between two dates (UTC midnights), stamped in the exchange's own timezone."""
@@ -156,9 +460,9 @@ def chart(symbol, start, end, interval="1d", prepost=False):
     try:
         res = get_json(url)["chart"]
     except urllib.error.HTTPError as e:
-        raise LookupError(f"Yahoo has no price data for {symbol} (HTTP {e.code}); check the ticker suffix.")
+        raise LookupError(yahoo_error(e))
     if not res.get("result") or not res["result"][0].get("timestamp"):
-        raise LookupError(f"Yahoo has no price data for {symbol} in {start}..{end}.")
+        raise LookupError(f"no bars in {start}..{end}")
     r = res["result"][0]
     tz = ZoneInfo(r["meta"]["exchangeTimezoneName"])
     q = r["indicators"]["quote"][0]
@@ -192,14 +496,13 @@ def yahoo_crumb():
 
 
 def quote_summary(symbol, modules):
-    url = (f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{urllib.parse.quote(symbol)}"
-           f"?modules={','.join(modules)}&crumb={urllib.parse.quote(yahoo_crumb())}")
     try:
-        res = get_json(url)["quoteSummary"]
+        res = get_json(f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{urllib.parse.quote(symbol)}"
+                       f"?modules={','.join(modules)}&crumb={urllib.parse.quote(yahoo_crumb())}")["quoteSummary"]
     except urllib.error.HTTPError as e:
-        raise LookupError(f"Yahoo has no company data for {symbol} (HTTP {e.code}).")
+        raise LookupError(yahoo_error(e))
     if not res.get("result"):
-        raise LookupError(f"Yahoo has no company data for {symbol}: {res.get('error')}")
+        raise LookupError(f"no company data: {res.get('error')}")
     return res["result"][0]
 
 
@@ -224,58 +527,127 @@ def binance_klines(base, quote, start, end, interval="1d"):
     if not rows:
         raise LookupError(f"Binance has no {symbol} candles in {start}..{end}.")
     bars = [Bar(datetime.fromtimestamp(r[0] / 1000, timezone.utc), *map(float, r[1:5]), float(r[7])) for r in rows]
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     meta = {"exchangeTimezoneName": "UTC", "longName": f"{base}/{quote}", "fullExchangeName": "Binance spot",
-            "currency": quote, "currentTradingPeriod": {"regular": {
-                "start": today.timestamp(), "end": (today + timedelta(days=1)).timestamp()}}}
+            "currency": quote, "source": "Binance"}
     return meta, bars, {}
 
 
-def prices(symbol, start, end, interval="1d", prepost=False):
-    pair = crypto_pair(symbol)
-    return binance_klines(*pair, start, end, interval) if pair else chart(symbol, start, end, interval, prepost)
+def futures(path):
+    """Rows from a Binance USDⓈ-M futures endpoint, [] when there are none. Binance refuses some requests with
+    HTTP 400 and others with an error object where the rows should be."""
+    try:
+        rows = get_json("https://fapi.binance.com" + path)
+    except (urllib.error.URLError, ValueError):
+        return []
+    return rows if isinstance(rows, list) else []
+
+
+def perp_stats(symbol, quote, t0, t1):
+    """Funding, open interest and positioning on a Binance perpetual between two times (ms), as one line."""
+    span = f"symbol={symbol}&startTime={t0}&endTime={t1}"
+    parts = []
+    funding = futures(f"/fapi/v1/fundingRate?{span}&limit=1000")
+    if funding:
+        rates = [f"{float(f['fundingRate']) * 100:+.4f}%" for f in funding]
+        every = round((funding[1]["fundingTime"] - funding[0]["fundingTime"]) / 3_600_000) if len(funding) > 1 else 0
+        parts.append(f"funding{f' every {every}h' if every else ''} "
+                     + " → ".join(rates if len(rates) <= 4 else [rates[0], "…", rates[-1]]))
+    oi = futures(f"/futures/data/openInterestHist?{span}&period=1h&limit=500")
+    if len(oi) > 1:
+        a, b = float(oi[0]["sumOpenInterestValue"]), float(oi[-1]["sumOpenInterestValue"])
+        parts.append(f"open interest {human(a)} → {human(b)} {quote} ({pct(b / a - 1)})")
+    # Shares of accounts with a net long position, and of top traders' position size that is long.
+    for path, label in (("globalLongShortAccountRatio", "accounts long"),
+                        ("topLongShortPositionRatio", "top traders' positions long")):
+        rows = futures(f"/futures/data/{path}?{span}&period=1h&limit=500")
+        if rows:
+            parts.append(f"{label} {float(rows[0]['longAccount']):.0%} → {float(rows[-1]['longAccount']):.0%}")
+    taker = futures(f"/futures/data/takerlongshortRatio?{span}&period=1h&limit=500")
+    if taker:
+        buy, sell = (sum(float(r[k]) for r in taker) for k in ("buyVol", "sellVol"))
+        parts.append(f"takers bought {buy / (buy + sell):.0%} of volume")
+    if parts and t1 < (time.time() - 30 * 86_400) * 1000:
+        parts.append("(Binance keeps 30 days of open interest and positioning)")
+    return " · ".join(parts)
 
 
 def show_derivatives(base, quote, day):
-    """Funding and open interest on the matching Binance USDⓈ-M perpetual, when there is one."""
-    symbol = base + quote
+    """Funding, open interest and positioning on the matching Binance USDⓈ-M perpetual, when there is one."""
     t0 = int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp() * 1000)
-    t1 = t0 + 86_400_000
+    line = perp_stats(base + quote, quote, t0, t0 + 86_400_000)
+    print(f"Perpetual futures, that UTC day: {line}" if line else
+          f"Perpetual futures: no {base + quote} perpetual on Binance (or it is unreachable from here).")
+
+
+EQUITY_PERPS = {"us": "EQUITY", "hk": "HK_EQUITY"}
+
+
+def stock_perp(sym):
+    """Binance's perpetual on a US or Hong Kong stock (NVDAUSDT, HK0700USDT), or None. A ticker can also be a coin's
+    (TUSDT is the Threshold token, not AT&T), so the contract's underlying type decides."""
+    mkt = market_of(sym)
+    if mkt not in EQUITY_PERPS or sym.startswith("^"):
+        return None
+    base = re.sub(r"[-.]", "", sym) if mkt == "us" else "HK" + sym.split(".")[0].lstrip("0").zfill(4)
     try:
-        funding = get_json(f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&startTime={t0}&endTime={t1}")
-    except urllib.error.HTTPError:
-        funding = []
-    if not funding:
-        print(f"Perpetual futures: no {symbol} perpetual on Binance (or it is unreachable from here).")
+        listed = get_json("https://fapi.binance.com/fapi/v1/exchangeInfo")["symbols"]
+    except (urllib.error.URLError, ValueError, KeyError):
+        return None
+    return next((s["symbol"] for s in listed if s.get("underlyingType") == EQUITY_PERPS[mkt]
+                 and s.get("baseAsset") == base and s.get("status") == "TRADING"), None)
+
+
+def show_stock_perp(perp, days, i, tz, hours):
+    """A stock's perpetual trades round the clock, so it shows when a gap formed and what came after the close."""
+    at = lambda d, hm: datetime.combine(d, datetime.strptime(hm, "%H:%M").time(), tz)
+    ms = lambda t: int(t.timestamp() * 1000)
+    now = datetime.now(tz)
+    legs = [("previous close → open", at(days[i - 1], hours[1]), at(days[i], hours[0]))]
+    close, nxt = at(days[i], hours[1]), at(days[i + 1], hours[0]) if i + 1 < len(days) else now
+    if close < now:
+        legs.append(("close → next open" if nxt < now else "close → now", close, min(nxt, now)))
+    t0, t1 = legs[0][1], min(legs[-1][2], now)
+    rows = futures(f"/fapi/v1/klines?symbol={perp}&interval=5m&startTime={ms(t0) - 300_000}&endTime={ms(t1)}"
+                   "&limit=1500")
+    if not rows:
+        print(f"Binance perpetual {perp}: no trades {t0:%a %H:%M}–{t1:%a %H:%M}.")
         return
-    line = "Perpetual futures: funding per 8h " + " → ".join(f"{float(f['fundingRate']) * 100:+.4f}%" for f in funding)
-    try:
-        oi = get_json(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={symbol}&period=1h"
-                      f"&startTime={t0}&endTime={t1}&limit=30")
-    except urllib.error.HTTPError:
-        oi = []
-    if len(oi) > 1:
-        first, last = float(oi[0]["sumOpenInterestValue"]), float(oi[-1]["sumOpenInterestValue"])
-        line += f" · open interest {human(first)} → {human(last)} {quote} ({pct(last / first - 1)})"
-    else:
-        line += " · open interest n/a (Binance keeps 30 days of history)"
-    print(line)
+    path = [(datetime.fromtimestamp((r[0] + 300_000) / 1000, tz), float(r[4])) for r in rows]  # (bar end, close)
+    price_at = lambda t: next((p for e, p in reversed(path) if e <= t), path[0][1])
+    print(f"Binance perpetual {perp} (trades round the clock; its price runs a little off the stock's):")
+    for label, a, b in legs:
+        b = min(b, now)
+        span = [x for x in path if a <= x[0] <= b]
+        hour = max(((x[0], y[0], y[1] / x[1] - 1) for x, y in zip(span, span[12:])), key=lambda m: abs(m[2]),
+                   default=None)
+        print(f"  {label} ({a:%a %H:%M} → {b:%a %H:%M}): {num(price_at(a))} → {num(price_at(b))}"
+              f" ({pct(price_at(b) / price_at(a) - 1)})"
+              + (f" · steepest hour {hour[0]:%a %H:%M}→{hour[1]:%H:%M} {pct(hour[2])}" if hour else ""))
+    stats = perp_stats(perp, "USDT", ms(t0), ms(t1))
+    if stats:
+        print(f"  {stats}")
 
 
 def cmd_binance_ai(a):
     base, quote = crypto_pair(a.symbol) or (a.symbol.upper(), "USDT")
-    # Undocumented endpoint behind the "<token> Insights" panel on binance.com trade pages. It answers 200 with
-    # data=null when a pair has no report, so check the body rather than the status.
-    d = get_json("https://www.binance.com/bapi/bigdata/v1/friendly/bigdata/search/ai-report/report",
+    when = datetime.fromisoformat(a.at) if a.at else datetime.now(timezone.utc)
+    when = when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+    # Undocumented endpoint behind the "<token> Insights" panel on binance.com trade pages. The report is rebuilt
+    # about hourly, and `timestamp` picks the one current then, back about 90 days. A pair or time without a report
+    # answers 200 with no modules, so check the body rather than the status.
+    d = get_json("https://www.binance.com/bapi/bigdata/v3/friendly/bigdata/search/ai-report/report",
                  headers={"Content-Type": "application/json"},
-                 data=json.dumps({"token": base, "symbol": base + quote, "product": "web-spot", "lang": "en",
-                                  "quoteToken": ""}).encode()).get("data")
-    if not d or not d.get("modules"):
-        raise LookupError(f"Binance has no AI report for {base}/{quote}.")
-    at = datetime.fromtimestamp(d["reportMeta"]["reportAt"] / 1000, timezone.utc)
-    print(f"Binance AI report for {base}/{quote} as of {at:%Y-%m-%d %H:%M} UTC. It describes that moment, and Binance"
-          " says it could be inaccurate, so treat its claims as leads to check.")
-    for m in d["modules"]:
+                 data=json.dumps({"lang": "en", "token": base, "symbol": base + quote, "product": "web-spot",
+                                  "timestamp": str(int(when.timestamp() * 1000)), "quoteToken": "", "version": "v4",
+                                  "translateToken": None, "extParams": {"markdown": True}}).encode())
+    report = ((d.get("data") or {}).get("report") or {}).get("original") or {}
+    if not report.get("modules"):
+        raise LookupError(f"Binance has no AI report for {base}/{quote}"
+                          + (f" as of {when:%Y-%m-%d %H:%M} UTC; it keeps about 90 days." if a.at else "."))
+    made = datetime.fromtimestamp(report["reportMeta"]["reportAt"] / 1000, timezone.utc)
+    print(f"Binance AI report for {base}/{quote} as of {made:%Y-%m-%d %H:%M} UTC. It describes that moment, and"
+          " Binance says it could be inaccurate, so treat its claims as leads to check.")
+    for m in report["modules"]:
         print(f"\n{AI_SECTIONS.get(m['type'], m['type'].replace('_', ' ').capitalize())}:")
         for p in m["points"]:
             print(p["content"])
@@ -298,11 +670,11 @@ def cmd_move(a):
     tz = ZoneInfo(meta["exchangeTimezoneName"])
     rets = daily_returns(bars)
     chg = rets[day]
-    reg = meta.get("currentTradingPeriod", {}).get("regular")
-    live = bool(reg) and i == len(bars) - 1 and reg["start"] <= datetime.now(timezone.utc).timestamp() < reg["end"]
+    hours, now = MARKETS[market_of(sym)].hours, datetime.now(tz)
+    live = i == len(bars) - 1 and day == now.date() and hours[0] <= f"{now:%H:%M}" < hours[1]
 
     print(f"{sym}  {meta.get('longName') or meta.get('shortName', '')}  {meta.get('fullExchangeName', '')}  "
-          f"{meta.get('currency', '')}  (times {tz.key})")
+          f"{meta.get('currency', '')}  (times {tz.key}; prices from {meta['source']})")
     if a.date and day != anchor:
         print(f"No {sym} session on {anchor:%a %Y-%m-%d} (weekend, holiday, weather closure or halt);"
               " showing the previous session.")
@@ -327,11 +699,19 @@ def cmd_move(a):
 
     bench = benchmark_of(sym)
     print(f"Same session date elsewhere ({day}):")
-    for c in [bench] + [s.strip().upper() for s in a.vs.split(",") if s.strip()]:
+
+    def returns(c):
         try:
-            cr = daily_returns(daily(prices(c, start, end)[1]))
+            return daily_returns(daily(prices(c, start, end)[1]))
         except LookupError as e:
-            print(f"  {c:<11} {e}")
+            return e
+
+    others = [bench] + [s.strip().upper() for s in a.vs.split(",") if s.strip()]
+    with ThreadPoolExecutor(4) as pool:
+        fetched = list(pool.map(returns, others))
+    for c, cr in zip(others, fetched):
+        if isinstance(cr, LookupError):
+            print(f"  {c:<11} {cr}")
             continue
         if day not in cr:
             print(f"  {c:<11} no session that day")
@@ -355,55 +735,113 @@ def cmd_move(a):
     if pair:
         show_derivatives(*pair, day)
     else:
-        show_analyst_actions(sym, day, tz)
+        show_analyst_actions(sym, day)
+        perp = stock_perp(sym)
+        if perp:
+            show_stock_perp(perp, days, i, tz, hours)
 
     if a.intraday:
-        show_intraday(sym, day, p.c, prepost=market_of(sym) == "us")
+        show_intraday(sym, day, p.c)
 
 
-def show_analyst_actions(sym, day, tz):
+RATINGS = {1: "Sell", 2: "Hold", 3: "Buy"}
+
+
+def analyst_actions(sym, since, until):
+    """US analysts' notes between two dates from moomoo, oldest first, each with the same firm's note before it:
+    (date, firm, rating, target, previous rating, previous target). Firms come most recently active first, so
+    paging stops at a page whose last firm has been quiet since before `since`."""
+    code = moomoo_symbol(sym)
+    if not code or not code.startswith("US."):
+        raise LookupError("moomoo tracks US analysts only; search the news for broker notes")
+    acts, key = [], ""
+    while True:
+        data, page = moomoo(f"/api/v1.0/quote/{code}/research/rating-summary",
+                            {"rating_dimension_type": 1, "limit": 20, "next_key": key})
+        firms = [f for f in data.get("inst_rating_summary_list") or [] if f.get("rating_item_list")]
+        for f in firms:
+            info, notes = f.get("institution_info") or {}, f["rating_item_list"]  # newest first
+            firm = info.get("institution_en_name") or info.get("institution_name") or "?"
+            for n, before in zip(notes, notes[1:] + [None]):
+                d = date.fromisoformat(n["recommendation_date_str"][:10])
+                if since <= d <= until:
+                    acts.append((d, firm, int(n["rating"]), n.get("target_price"),
+                                 before and int(before["rating"]), before and before.get("target_price")))
+        if (not page.get("has_more") or not page.get("next_key") or not firms
+                or date.fromisoformat(firms[-1]["rating_item_list"][0]["recommendation_date_str"][:10]) < since):
+            return sorted(acts)
+        key = page["next_key"]
+
+
+def rating_change(r, t, r0, t0):
+    """'downgrade Buy→Hold, target 240→220' and the like."""
+    if r0 is None:
+        what = f"rates {RATINGS.get(r, r)} (its first note on record)"
+    elif r != r0:
+        what = f"{'upgrade' if r > r0 else 'downgrade'} {RATINGS.get(r0, r0)}→{RATINGS.get(r, r)}"
+    else:
+        what = f"keeps {RATINGS.get(r, r)}"
+    if t and t0 and t != t0:
+        return f"{what}, target {t0:g}→{t:g}"
+    return f"{what}, target {t:g}" if t else what
+
+
+def show_analyst_actions(sym, day):
+    since = day - timedelta(days=7)
     try:
-        hist = quote_summary(sym, ["upgradeDowngradeHistory"]).get("upgradeDowngradeHistory", {}).get("history", [])
-    except LookupError:
-        hist = []
-    week = [h for h in hist if day - timedelta(days=7) <= datetime.fromtimestamp(h["epochGradeDate"], tz).date() <= day]
-    print(f"Analyst rating actions {day - timedelta(days=7)}..{day} (Yahoo; thin outside the US):"
-          f"{'' if week else ' none found'}")
-    for h in sorted(week, key=lambda h: h["epochGradeDate"]):
-        target = f"  target {h.get('priorPriceTarget') or '?'}→{h['currentPriceTarget']}" \
-            if h.get("currentPriceTarget") else ""
-        print(f"  {datetime.fromtimestamp(h['epochGradeDate'], tz):%Y-%m-%d}  {h['firm']}: "
-              f"{ANALYST_ACTIONS.get(h['action'], h['action'])} {h.get('fromGrade') or ''}→{h['toGrade']}{target}")
-
-
-def show_intraday(sym, day, prev_close, prepost):
-    if not crypto_pair(sym) and (date.today() - day).days > 58:
-        print("Intraday: Yahoo only keeps 5-minute bars for about 60 days.")
+        acts = analyst_actions(sym, since, day)
+    except LookupError as e:
+        print(f"Analyst rating actions: {e}")
         return
-    meta, bars, _ = prices(sym, day - timedelta(days=1), day + timedelta(days=2), "5m", prepost)
-    bars = [b for b in bars if b.t.date() == day]
-    periods = meta.get("tradingPeriods") or []
-    periods = [p for ps in (periods["regular"] if isinstance(periods, dict) else periods) for p in ps]
-    regular = [b for b in bars if any(p["start"] <= b.t.timestamp() < p["end"] for p in periods)] or bars
+    changed = [x for x in acts if x[4] is None or (x[2], x[3]) != (x[4], x[5])]
+    kept = len(acts) - len(changed)
+    notes = f"{kept} note{'' if kept == 1 else 's'}"
+    print(f"Analyst rating actions {since}..{day} (moomoo):" + (
+        " none found" if not acts else f" {notes}, none changing rating or target" if not changed else
+        f" {notes} kept rating and target; changes:" if kept else ""))
+    for d, firm, *ratings in changed:
+        print(f"  {d}  {firm}: {rating_change(*ratings)}")
+
+
+def show_intraday(sym, day, prev_close):
+    us = market_of(sym) == "us"
+    try:
+        meta, bars, _ = prices(sym, day - timedelta(days=1), day + timedelta(days=2), "5m", prepost=us)
+    except LookupError as e:
+        print(f"Intraday: {e}")
+        return
+    tz = ZoneInfo(meta["exchangeTimezoneName"])
+    # A US trading day runs from the overnight session the evening before to the one after it.
+    start = datetime.combine(day, datetime.min.time(), tz) - timedelta(hours=4 if us else 0)
+    bars = [b for b in bars if start <= b.t < start + timedelta(hours=32 if us else 24)]
+    hours, starts = MARKETS[market_of(sym)].hours, meta.get("regular")
+    regular = [b for b in bars if (int(b.t.timestamp()) in starts if starts is not None
+                                   else hours[0] <= f"{b.t:%H:%M}" < hours[1])]
     if not regular:
         print("Intraday: no 5-minute bars for that session.")
         return
-    print(f"Intraday {day} (5-minute bars, {regular[0].t.tzname()}):")
-    pre = [b for b in bars if b.t < regular[0].t]
-    if pre:
-        print(f"  pre-market {pre[0].t:%H:%M}–{pre[-1].t:%H:%M}: {num(pre[0].c)} → {num(pre[-1].c)}"
-              f" ({pct(pre[-1].c / prev_close - 1)} vs previous close)")
+    print(f"Intraday {day} (5-minute bars, {regular[0].t.tzname()}, from {meta['source']}):")
+    open_, close = regular[0], regular[-1]
+
+    def span(label, part, ref, versus):
+        if part:
+            print(f"  {label} {part[0].t:%H:%M}–{part[-1].t + timedelta(minutes=5):%H:%M}: {num(part[0].o)} →"
+                  f" {num(part[-1].c)} ({pct(part[-1].c / ref - 1)} vs {versus})")
+
+    early = [b for b in bars if b.t < open_.t] if us else []  # elsewhere these are auctions
+    span("overnight", [b for b in early if b.t.date() < day or b.t.hour < 4], prev_close, "previous close")
+    span("pre-market", [b for b in early if b.t.date() == day and b.t.hour >= 4], prev_close, "previous close")
     step = 3 if len(regular) > 150 else 1  # round-the-clock markets: every third hour
-    path = [b for k, b in enumerate(regular) if k == 0 or (b.t.minute == 0 and b.t.hour % step == 0)] + [regular[-1]]
+    path = [b for k, b in enumerate(regular) if k == 0 or (b.t.minute == 0 and b.t.hour % step == 0)] + [close]
     print("  path " + " · ".join(f"{b.t:%H:%M} {num(b.c)}" for b in path))
     if len(regular) > 6:
         moves = [(regular[k + 6].c / regular[k].c - 1, regular[k].t, regular[k + 6].t) for k in range(len(regular) - 6)]
         lo, hi = min(moves), max(moves)
         print(f"  steepest 30-min fall {lo[1]:%H:%M}→{lo[2]:%H:%M} {pct(lo[0])}"
               f" · steepest 30-min rise {hi[1]:%H:%M}→{hi[2]:%H:%M} {pct(hi[0])}")
-    post = [b for b in bars if b.t > regular[-1].t]
-    if post:
-        print(f"  after hours to {post[-1].t:%H:%M}: {num(post[-1].c)} ({pct(post[-1].c / regular[-1].c - 1)} vs close)")
+    late = [b for b in bars if b.t > close.t] if us else []
+    span("after hours", [b for b in late if b.t.date() == day and b.t.hour < 20], close.c, "close")
+    span("overnight", [b for b in late if b.t.date() > day or b.t.hour >= 20], close.c, "close")
 
 
 # --- news ------------------------------------------------------------------------------------
@@ -438,13 +876,17 @@ def cmd_news(a):
     moomoo = [x for x in google_news(f"{a.query} {MOOMOO_SITES}{window}", edition, tz)
               if not MOOMOO_NOT_NEWS.search(x[2])][:a.n]
     others = google_news(f"{a.query} {NOT_MOOMOO_SITES}{window}", edition, tz)[:a.n]
+    yahoo = ""
     if a.symbol:
         pair = crypto_pair(a.symbol)
-        others += [x for x in yahoo_news(f"{pair[0]}-USD" if pair else a.symbol.upper(), tz)
-                   if not since or since - timedelta(days=1) <= x[0].date() <= until + timedelta(days=1)]
+        try:
+            others += [x for x in yahoo_news(f"{pair[0]}-USD" if pair else a.symbol.upper(), tz)
+                       if not since or since - timedelta(days=1) <= x[0].date() <= until + timedelta(days=1)]
+            yahoo = " + Yahoo"
+        except urllib.error.HTTPError as e:
+            yahoo = f"; Yahoo headlines unavailable, HTTP {e.code}"
     span = f"{since}..{until}" if since else "last 7 days"
-    print(f'News for "{a.query}" ({span}, Google News {edition[0]}{" + Yahoo" if a.symbol else ""}),'
-          f" times {tz.key}, oldest first")
+    print(f'News for "{a.query}" ({span}, Google News {edition[0]}{yahoo}), times {tz.key}, oldest first')
     if not all(x[4] for x in moomoo + others):
         print("--:-- means Google only gave a date (±1 day); read the article for its real publish time.")
     seen = set()
@@ -682,49 +1124,172 @@ PROFILE_ROWS = [
 ]
 PROFILE_MODULES = ["price", "assetProfile", "summaryDetail", "defaultKeyStatistics", "financialData",
                    "calendarEvents", "earningsHistory", "upgradeDowngradeHistory"]
+# moomoo's key indicators for the latest reported quarter, by the name it gives them.
+MOOMOO_RATIOS = [("Gross margin", "Gross Margin"), ("Operating margin", "Operating Margin"),
+                 ("Net margin", "Net Margin"), ("LT debt/equity", "Long-Term Debt to Equity Ratio")]
+CONSENSUS = {5: "Strong buy", 4: "Buy", 3: "Hold", 2: "Underperform", 1: "Sell"}
+PROFILE_ORDER = ["Name", "Sector", "Industry", "Currency", "Price", "Market cap", "52-week range", "52-week change",
+                 "P/E trailing", "P/E forward", "P/E, industry average", "P/E percentile, 1 year", "P/B", "EV/EBITDA",
+                 "Dividend yield", "Revenue growth y/y", "Earnings growth y/y", "Gross margin", "Operating margin",
+                 "Net margin", "Margins from", "ROE", "Debt/equity %", "LT debt/equity", "Beta", "Consensus",
+                 "Analysts", "Analyst target, mean", "Latest quarter", "Ex-dividend date", "Next earnings"]
+PROFILE_NOTES = {
+    "moomoo": "moomoo data, with CNBC's quote: price, valuation and dividend yield are current; ROE and debt/equity"
+              " are CNBC's trailing twelve months and latest quarter; margins are the quarter shown.",
+    "Yahoo": "Yahoo data: ratios use the latest reported quarter or trailing twelve months.",
+}
+
+
+def analysts(estimate):
+    n = estimate.get("num_analysts")
+    return f"{n or '?'} analyst{'' if n == 1 else 's'}"
+
+
+def year_on_year(history):
+    """The latest actual in moomoo's estimate history against the same period a year earlier."""
+    if not history:
+        return None
+    now = history[0]
+    then = next((h for h in history if h.get("fiscal_year") == now.get("fiscal_year", 0) - 1
+                 and h.get("fiscal_quarter") == now.get("fiscal_quarter")), None)
+    try:
+        a, b = float(now["actual_value"]), float(then["actual_value"])
+    except (TypeError, KeyError, ValueError):
+        return None
+    return pct(a / b - 1) if b > 0 else None
+
+
+def moomoo_profile(sym):
+    """Rows (label → value) and detail lines for one US, Hong Kong or Singapore stock. moomoo's snapshot leaves out
+    Singapore, so CNBC's quote fills in the price and the basic ratios. A part that fails is left out."""
+    code, key = moomoo_symbol(sym), moomoo_key()
+    if not isinstance(key, tuple):
+        raise LookupError(key or "no AppKey set up (references/markets.md says how)")
+    if not code:
+        raise LookupError("covers US, Hong Kong and Singapore stocks only")
+
+    def part(path, query=None, body=None):
+        try:
+            return moomoo(f"/api/v1.0/quote/{path}", query, body)[0]
+        except LookupError:
+            return {}
+
+    snap = (part("snapshot", body={"code_list": [code]}).get("snapshot_list") or [{}])[0]
+    q = cnbc_quote(sym)
+    if not snap.get("last_price") and not q.get("last"):
+        raise LookupError(f"no quote for {code}")
+    val = part(f"{code}/valuation/detail", {"valuation_type": 1, "interval_type": 3})
+    trend, plate = val.get("trend") or {}, val.get("plate_distribution") or {}
+    book = snap.get("pb_ratio") or (part(f"{code}/valuation/detail", {"valuation_type": 2, "interval_type": 3})
+                                    .get("trend") or {}).get("current_value")
+    eps, revenue = (part(f"{code}/financials/estimate", {"estimate_type": k, "hist_count": 5, "fut_count": 1})
+                    for k in ("EPS_GAAP", "REVENUE"))
+    report = (part(f"{code}/financials/statements", {"statement_type": 4, "limit": 1}).get("report_list") or [{}])[0]
+    ratios = {x.get("display_name"): x.get("data") for x in report.get("item_list") or []}
+    cons = part(f"{code}/research/analyst-consensus")
+    rows = {
+        "Name": snap.get("name") or q.get("name"), "Industry": plate.get("plate_name"),
+        "Currency": q.get("currencyCode"),
+        "Price": num(snap["last_price"]) if snap.get("last_price") else q.get("last"),
+        "Market cap": human(snap["total_market_val"]) if snap.get("total_market_val") else q.get("mktcapView"),
+        "52-week range": f"{num(snap['lowest52weeks_price'])}–{num(snap['highest52weeks_price'])}"
+        if snap.get("highest52weeks_price") else f"{q['yrloprice']}–{q['yrhiprice']}" if q.get("yrhiprice") else None,
+        "P/E trailing": snap.get("pe_ttm_ratio") or q.get("pe"), "P/E forward": trend.get("forward_value"),
+        "P/E, industry average": plate.get("plate_average_value"),
+        "P/E percentile, 1 year": f"{trend['valuation_percentile']:.0f}%" if "valuation_percentile" in trend else None,
+        "P/B": book,
+        "Dividend yield": f"{snap['dividend_ratio_ttm']:.2f}%" if snap.get("dividend_ratio_ttm") is not None
+        else q.get("dividendyield"),
+        "Revenue growth y/y": year_on_year(revenue.get("historical_estimates")),
+        "Earnings growth y/y": year_on_year(eps.get("historical_estimates")),
+        **{label: f"{ratios[name]:.1f}%" for label, name in MOOMOO_RATIOS
+           if isinstance(ratios.get(name), (int, float))},
+        "ROE": q.get("ROETTM") or (f"{ratios['ROE']:.1f}% (that quarter)" if "ROE" in ratios else None),
+        "Debt/equity %": q.get("DEBTEQTYQ"), "Margins from": report.get("period_text"), "Beta": q.get("beta"),
+        "Latest quarter": (eps.get("historical_estimates") or [{}])[0].get("period_str") or report.get("period_text"),
+        "Consensus": CONSENSUS.get(cons.get("rating")) if cons.get("total") else None, "Analysts": cons.get("total"),
+        "Analyst target, mean": f"{num(cons['average'])} (range {num(cons['lowest'])}–{num(cons['highest'])})"
+        if cons.get("average") else None,
+    }
+    details = []
+    for h in (eps.get("historical_estimates") or [])[:4]:
+        try:
+            surprise = f", surprise {pct(float(h['actual_value']) / float(h['consensus_mean']) - 1)}"
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            surprise = ""
+        details.append(f"  {h.get('period_str')}: actual {h.get('actual_value') or '–'} vs estimate"
+                       f" {h.get('consensus_mean') or '–'} ({analysts(h)}{surprise})")
+    for h in (eps.get("future_estimates") or [])[:1]:
+        details.append(f"  next, {h.get('period_str')}: estimate {h.get('consensus_mean') or '–'}"
+                       f" ({analysts(h)})")
+    if details:
+        details.insert(0, f"EPS vs consensus ({eps.get('currency') or 'reporting currency'}):")
+    if code.startswith("US."):
+        try:
+            changed = [x for x in analyst_actions(sym, date.today() - timedelta(days=30), date.today())
+                       if x[4] is None or (x[2], x[3]) != (x[4], x[5])][-8:]
+        except LookupError:
+            changed = []
+        details += ["Latest analyst changes, last 30 days:"] * bool(changed)
+        details += [f"  {d}  {firm}: {rating_change(*ratings)}" for d, firm, *ratings in changed]
+    return rows, details
+
+
+def yahoo_profile(sym):
+    d = quote_summary(sym, PROFILE_MODULES)
+
+    def val(module, field):
+        v = d.get(module, {}).get(field)
+        return str(v.get("fmt", "") if isinstance(v, dict) else v or "") or None
+
+    rows = {label: val(m, f) for label, m, f in PROFILE_ROWS}
+    rows["Consensus"] = (rows["Consensus"] or "").replace("_", " ").capitalize() or None  # strong_buy
+    rows["Next earnings"] = " / ".join(e.get("fmt", "") for e in d.get("calendarEvents", {}).get("earnings", {})
+                                       .get("earningsDate", [])) or None
+    details = []
+    for e in d.get("earningsHistory", {}).get("history", []):
+        details.append(f"  quarter ending {e.get('quarter', {}).get('fmt', '?')}: actual"
+                       f" {e.get('epsActual', {}).get('fmt', '–')} vs estimate {e.get('epsEstimate', {}).get('fmt', '–')}"
+                       f" (surprise {e.get('surprisePercent', {}).get('fmt', '–')})")
+    if details:
+        details.insert(0, "EPS vs consensus:")
+    acts = d.get("upgradeDowngradeHistory", {}).get("history", [])[:8]
+    details += ["Latest analyst actions:"] * bool(acts)
+    for h in acts:
+        details.append(f"  {datetime.fromtimestamp(h['epochGradeDate'], timezone.utc):%Y-%m-%d}  {h['firm']}:"
+                       f" {ANALYST_ACTIONS.get(h['action'], h['action'])} {h.get('fromGrade') or ''}→{h['toGrade']}"
+                       f"{'  target ' + str(h['currentPriceTarget']) if h.get('currentPriceTarget') else ''}")
+    return rows, details
 
 
 def cmd_profile(a):
     syms = [s.upper() for s in a.symbols]
-    data = {}
+    data, used = {}, {}
     for s in syms:
         if crypto_pair(s):
             print(f"{s} is a crypto pair; profile covers companies (use move, news and binance-ai).")
-            data[s] = {}
             continue
-        try:
-            data[s] = quote_summary(s, PROFILE_MODULES)
-        except LookupError as e:
-            print(e)
-            data[s] = {}
-
-    def val(d, module, field):
-        v = d.get(module, {}).get(field)
-        return str(v.get("fmt", "") if isinstance(v, dict) else v or "") or "–"
-
-    table = [["", *syms]] + [[label, *(val(data[s], m, f) for s in syms)] for label, m, f in PROFILE_ROWS]
-    table.append(["Next earnings", *(" / ".join(e.get("fmt", "") for e in data[s].get("calendarEvents", {})
-                                                 .get("earnings", {}).get("earningsDate", [])) or "–" for s in syms)])
+        failed = []
+        for name, source in (("moomoo", moomoo_profile), ("Yahoo", yahoo_profile)):
+            try:
+                data[s], used[name] = source(s), True
+                break
+            except (LookupError, OSError, ValueError, KeyError) as e:
+                failed.append(f"{name}: {e}")
+        else:
+            print(f"No company data for {s}: {'; '.join(failed)}.")
+    cols = [s for s in syms if s in data]
+    if not cols:
+        return
+    fmt = lambda v: "–" if v in (None, "") else f"{v:,.2f}" if isinstance(v, float) else str(v)
+    labels = [label for label in PROFILE_ORDER if any(data[s][0].get(label) not in (None, "") for s in cols)]
+    table = [["", *cols]] + [[label, *(fmt(data[s][0].get(label)) for s in cols)] for label in labels]
     widths = [max(len(row[c][:28]) for row in table) for c in range(len(table[0]))]
     for row in table:
         print("  ".join(cell[:28].ljust(w) for cell, w in zip(row, widths)).rstrip())
-    print("Yahoo data: ratios use the latest reported quarter or trailing twelve months; check key numbers"
-          " against filings.")
-    if len(syms) == 1 and data[syms[0]]:
-        d = data[syms[0]]
-        eps = d.get("earningsHistory", {}).get("history", [])
-        if eps:
-            print("EPS vs consensus:")
-            for e in eps:
-                print(f"  quarter ending {e.get('quarter', {}).get('fmt', '?')}: actual {e.get('epsActual', {}).get('fmt', '–')} vs estimate"
-                      f" {e.get('epsEstimate', {}).get('fmt', '–')} (surprise {e.get('surprisePercent', {}).get('fmt', '–')})")
-        acts = d.get("upgradeDowngradeHistory", {}).get("history", [])[:8]
-        if acts:
-            print("Latest analyst actions:")
-            for h in acts:
-                print(f"  {datetime.fromtimestamp(h['epochGradeDate'], timezone.utc):%Y-%m-%d}  {h['firm']}:"
-                      f" {ANALYST_ACTIONS.get(h['action'], h['action'])} {h.get('fromGrade') or ''}→{h['toGrade']}"
-                      f"{'  target ' + str(h['currentPriceTarget']) if h.get('currentPriceTarget') else ''}")
+    print(" ".join(PROFILE_NOTES[name] for name in used) + " Check key numbers against filings.")
+    if len(cols) == 1:
+        print("\n".join(data[cols[0]][1]))
 
 
 # --- prediction markets ----------------------------------------------------------------------
@@ -927,7 +1492,8 @@ def main():
     m.add_argument("--date", help="session date YYYY-MM-DD in the exchange's local time, UTC for crypto"
                                   " (default: latest)")
     m.add_argument("--vs", default="", help="comma-separated peers, sector ETFs or ADRs to compare")
-    m.add_argument("--intraday", action="store_true", help="5-minute path of the session (last ~60 days only)")
+    m.add_argument("--intraday", action="store_true",
+                   help="5-minute path of the session, with US pre-market, after-hours and overnight trading")
     n = sub.add_parser("news", help="headlines: moomoo/Futu first, then other outlets (Yahoo too with --symbol)")
     n.add_argument("query")
     n.add_argument("--from", dest="since", help="YYYY-MM-DD (default: last 7 days)")
@@ -945,6 +1511,7 @@ def main():
     p.add_argument("symbols", nargs="+")
     b = sub.add_parser("binance-ai", help="Binance's AI report (TL;DR, drivers, risks) for a crypto pair")
     b.add_argument("symbol", help="BNBUSDT, BNB/USDT or just BNB")
+    b.add_argument("--at", help='"YYYY-MM-DD HH:MM" in UTC: the report current then (about 90 days back; default now)')
     o = sub.add_parser("odds", help="Kalshi and Polymarket odds on an event (Fed, CPI, tariffs, elections, a company)")
     o.add_argument("query", help='a few keywords, e.g. "fed rate", "cpi", "tariff", "shutdown", "tesla deliveries"')
     o.add_argument("--date", help="YYYY-MM-DD: how the odds moved that day, including markets since closed")
@@ -958,6 +1525,8 @@ def main():
         sys.exit(str(e))
     except urllib.error.HTTPError as e:
         sys.exit(f"HTTP {e.code} from {e.url}")
+    except (urllib.error.URLError, TimeoutError) as e:  # a source down or slow: say so, rerun later
+        sys.exit(f"Network error: {getattr(e, 'reason', e)}")
 
 
 if __name__ == "__main__":

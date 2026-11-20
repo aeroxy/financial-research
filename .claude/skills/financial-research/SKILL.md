@@ -11,13 +11,15 @@ The goal is an answer a skeptical analyst would accept: numbers checked against 
 
 `scripts/fin.py` in this skill's directory fetches market data with the Python standard library. Run `python3 <skill-dir>/scripts/fin.py <command> --help` for every option. Symbols are Yahoo Finance tickers (`T`, `D05.SI`, `0700.HK`, `7203.T`, `005930.KS`, `2330.TW`, `600519.SS`, `RELIANCE.NS`). Crypto pairs use Binance symbols (`BTCUSDT`, `BNB/USDT`). For other markets' suffixes, benchmarks, trading hours and disclosure sources, and the crypto specifics, see `references/markets.md`.
 
+Stock prices come from moomoo for US, Hong Kong and Singapore stocks when a moomoo AppKey is set up, otherwise from CNBC, and from Yahoo last. `move`'s first line names the source that answered and why any before it failed. `references/markets.md` says what each source covers and how to set up the AppKey.
+
 | Command | What it gives you |
 |---|---|
-| `move SYM --date D --vs P1,P2 [--intraday]` | The session in numbers: % change, gap at the open against the move during trading, volume against its 20-day average, size in standard deviations, a market vs stock-specific split, peers on the same date, surrounding sessions, ex-dividend flags and that week's analyst actions. `--intraday` adds the 5-minute path, including US pre-market (last ~60 days only). Crypto pairs: UTC days, BTC as the benchmark (ETH for BTC itself), and the Binance perpetual's funding and open-interest change. |
+| `move SYM --date D --vs P1,P2 [--intraday]` | The session in numbers: % change, gap at the open against the move during trading, volume against its 20-day average, size in standard deviations, a market vs stock-specific split, peers on the same date, surrounding sessions, ex-dividend flags and that week's US analyst rating and target changes. For US and Hong Kong stocks that Binance lists as perpetual futures (NVDA, TSLA, 0700.HK and about 200 more), it adds how the perpetual moved from the previous close to the open, with its steepest hour, and after the close, plus its funding and positioning. `--intraday` adds the 5-minute path; for US stocks also the overnight session, pre-market and after-hours. Crypto pairs: UTC days, BTC as the benchmark (ETH for BTC itself), and the Binance perpetual's funding, open interest, long/short positioning and taker flow. |
 | `news "QUERY" --from D --to D [--symbol SYM] [--local]` | Headlines in exchange-local time, oldest first, in two blocks. **Moomoo / Futu first: the main news source.** It republishes Dow Jones, MT Newswires, Cailian and exchange filings with exact timestamps. **Other outlets** follow for independent confirmation, plus Yahoo's headlines when `--symbol` is given. `--local` switches to the local-language edition, where Futu's Chinese coverage is the richest for Hong Kong and China. |
 | `filings SYM --from D --to D` | US: SEC filings with exact acceptance times, 8-K item names and exhibit links. Asia: exchange announcements where a feed is wired up (see `references/markets.md`). Crypto: Binance listing, delisting, maintenance, news and airdrop notices that mention the token. |
-| `profile SYM [SYM ...]` | Valuation, growth, margins and consensus as a side-by-side table. With one symbol it adds EPS actual vs estimate and the latest analyst actions. Companies only. |
-| `binance-ai PAIR` | Binance's own AI report on a crypto pair (TL;DR, key drivers, risks) with its timestamp, the same as the "Insights" panel on the pair's binance.com trade page. It covers only the latest window, and Binance says it may be inaccurate, so use its drivers as leads to verify, never as the answer on their own. |
+| `profile SYM [SYM ...]` | Valuation, growth, margins and consensus as a side-by-side table: moomoo (with CNBC's quote) for US, Hong Kong and Singapore stocks, Yahoo for the rest. With one symbol it adds EPS actual vs estimate and the latest analyst changes. Companies only. |
+| `binance-ai PAIR [--at "YYYY-MM-DD HH:MM"]` | Binance's own AI report on a crypto pair (TL;DR, key drivers, risks) with its timestamp, the same as the "Insights" panel on the pair's binance.com trade page. It is rebuilt about hourly; `--at` (UTC) reads the one current at an earlier hour, back about 90 days, such as the hour of a move. Binance says it may be inaccurate, so use its drivers as leads to verify, never as the answer on their own. |
 | `odds "QUERY" [--date D]` | Kalshi and Polymarket prices on an event, as implied probabilities: Fed decisions, CPI and jobs prints, tariffs, shutdowns, elections, and some company questions (Tesla deliveries, what a CEO says on the call). Each market shows its mid-quote, 1-day change, volume and depth, flagged `THIN` when the price is unreliable. `--date` adds how each market moved that day and its largest step between hourly readings, including markets that have since settled (US time by default; `--market` changes it). Matching is by keyword, so try two phrasings ("fed decision", "fed rate"). Coverage is US-centric, with little on Asian stocks. |
 
 Other tools for reading and searching:
@@ -40,21 +42,21 @@ Pick 2–4 comparisons yourself, because Yahoo's "similar stocks" are often unre
 - **Premise.** Does the move match what the user said? If it was 3% rather than 8%, or Thursday rather than Friday, say so up front and explain the real move.
 - **Ex-dividend.** If the session was an ex-dividend date, that part of the drop is mechanical. Asian banks and REITs can go ex by 3–6% at once.
 - **Scope.** Is it market-wide (benchmark moved about as much), sector-wide (peers moved too) or stock-specific? This decides which news to look for. The market/stock split relies on beta, so when the correlation line says the link is weak, lean on peers instead.
-- **Timing.** A gap at the open means the news came out while the market was closed. A slide during trading means news during the session, and the 5-minute path shows roughly when.
+- **Timing.** A gap at the open means the news came out while the market was closed. A slide during trading means news during the session, and the 5-minute path shows roughly when. For a gap, the Binance perpetual's steepest hour between the previous close and the open, and for US stocks the overnight and pre-market lines of `--intraday`, show when it formed: match that hour against the news.
 - **Conviction.** Volume above about 2× its average signals real news. Big moves on thin volume are often drift, rebalancing or sympathy moves.
 - **Context.** Earlier sessions often explain a later one (a drop after earnings two days earlier, a streak of losses, a bounce). So do the week's analyst target cuts.
 
 **3. Gather candidate causes** from the previous close to the end of the session.
 - Company: `fin.py filings`. Results releases, profit warnings, guidance, executive departures, deals, offerings and trading halts usually come out here before anywhere else.
 - News: `fin.py news "<company name>" --from <previous session> --to <D> --symbol SYM`. Start with the moomoo/Futu block and confirm with the other block. Moomoo republishes other publishers, so when judging independence count the source it credits (Dow Jones, Cailian, MT Newswires). For Asian stocks, run it again with `--local` and the local name. Also search the ticker and the CEO's name when the company name is generic.
-- Broker actions outside the US: Yahoo tracks US analyst actions only. For Asian stocks, run `fin.py news "<company> downgrade OR upgrade OR target price"` over the two sessions before the move as well as the day itself. A downgrade the day before often explains a weak open.
+- Broker actions outside the US: `move` lists US analysts' changes only. For Asian stocks, run `fin.py news "<company> downgrade OR upgrade OR target price"` over the two sessions before the move as well as the day itself. A downgrade the day before often explains a weak open.
 - Sector: if peers moved too, search the competitor, regulator or industry story (`fin.py news "<industry or rival>"`).
 - Macro: if the benchmark moved more than ~1%, look at that day's macro news: central banks, inflation, jobs data, tariffs, geopolitics, and for Asia, the overnight US session.
 - Event odds: when a scheduled or political event is a candidate, run `fin.py odds "<event>" --date D` and check whether the odds jumped in the same hour as the price. On a CPI day, a 20-point swing in the Fed-decision market at 08:30 ties a rate-sensitive selloff to the print; odds that didn't move argue against that cause. This is market evidence of timing and scope, like a peer's move, not a source that names the cause.
 - Crypto: compare the coin with BTC first; most altcoin days are BTC days. Then check:
   - Binance's notices (`fin.py filings PAIR`).
-  - The futures line: funding and open interest show whether leverage drove the move.
-  - `fin.py binance-ai PAIR` for Binance's own reading.
+  - The futures line: funding, open interest, the share of accounts and of top traders' positions that are long, and how much of the volume takers bought show whether leverage drove the move (`references/markets.md` says how to read them).
+  - `fin.py binance-ai PAIR --at "<an hour into the move, UTC>"` for Binance's own reading at the time.
   - Coin-specific catalysts: token unlocks, listings on other exchanges, hacks or exploits, ETF flows, and protocol upgrades.
 - "Why X stock fell today" explainers (Motley Fool, Barron's, Investopedia, CNBC's premarket and midday movers) are good leads because they name the catalyst. Trace each claim back to the original report, filing or analyst note before relying on it.
 
@@ -98,8 +100,10 @@ Match the length to the question. A quick "why is X down today" during trading h
 
 ## Pitfalls
 
-- **Live data.** During a session, Yahoo's latest daily bar is live, and `move` says so.
-- **Data vintage.** Fundamentals (`profile`) reflect the last reported quarter, which the table shows. Growth rates there can be distorted by one-off items, so check any number you lean on against the filing.
+- **Live data.** During a session the latest daily bar is live, and `move` says so.
+- **Price sources.** When `move` names CNBC because moomoo's history quota is used up, the numbers still hold; only the US overnight session is missing. Yahoo's HTTP 429 means it is rate-limiting this machine, not that the ticker is wrong.
+- **Perpetuals on stocks.** A stock's Binance perpetual trades on Binance, round the clock and on weekends. Its price runs a little off the stock's and reflects crypto traders' positioning, so use it to time a move, not as the stock's price.
+- **Data vintage.** Fundamentals (`profile`) reflect the last reported quarter, which the table shows; moomoo's margins are for the quarter in "Margins from". Growth rates there can be distorted by one-off items, so check any number you lean on against the filing.
 - **Mismatched sources.** A recap that quotes numbers from a different quarter or share class is a common error. Check the period and the security.
 - **Date mismatches.** Aggregators sometimes stamp syndicated stories with the re-publish time. When timing matters, use the original outlet's timestamp.
 - **Missing data.** A source that failed, timed out or sat behind a paywall is not evidence that nothing happened. Say which source you couldn't check.

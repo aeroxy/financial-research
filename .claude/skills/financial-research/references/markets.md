@@ -1,6 +1,6 @@
 # Markets
 
-Recipes below were verified in October 2026. Sites change: if one breaks, say so in the answer and fall back to news and the company's investor-relations site. Don't present a failed lookup as "no announcements".
+Recipes below were verified in October 2026, and the price sources in November 2026. Sites change: if one breaks, say so in the answer and fall back to news and the company's investor-relations site. Don't present a failed lookup as "no announcements".
 
 | Market | Yahoo ticker | `move` benchmark | Session (local time) | Daily limit | `filings` source |
 |---|---|---|---|---|---|
@@ -14,6 +14,36 @@ Recipes below were verified in October 2026. Sites change: if one breaks, say so
 | India | `RELIANCE.NS` | ^NSEI | 09:15–15:30 | bands 2–20%; F&O stocks dynamic | NSE |
 | Crypto (Binance) | `BTCUSDT`, `BNB/USDT`, `ETH/BTC` | BTCUSDT (ETHUSDT for BTC) | 24/7, days in UTC | none | Binance announcements |
 
+## Price sources
+
+`move` takes prices from the first source that covers the symbol. Its first line names the source that answered and why any before it failed.
+
+| Source | Covers | Notes |
+|---|---|---|
+| moomoo OpenAPI (needs an AppKey, below) | US, Hong Kong and Singapore stocks and ETFs | Daily and 5-minute bars going back years, with the US overnight session, pre-market and after-hours; dividends and splits; US analysts' rating and target changes; consensus, valuation, estimates and margins for `profile`. No US indices, and no Japanese or mainland Chinese data for international accounts. |
+| CNBC (no key) | Indices, and stocks in the US, Singapore, Hong Kong, Taiwan, India, Korea and mainland China | US 5-minute bars include pre-market and after-hours, not the overnight session. Not covered: most Japanese stocks, KOSDAQ (`.KQ`) and Taiwan's OTC market (`.TWO`). |
+| Yahoo Finance (no key) | The rest | At times it answers every request from a machine with HTTP 429 for hours. |
+
+**moomoo's history quota.** The first read of a symbol's history takes one of the account's history slots for 7 days, about 100 on a small account, and rereads that week are free. Peers in `--vs` take slots too. When none are left, `move` says so and uses CNBC.
+
+**Setting up a moomoo AppKey.** moomoo's API is free with a moomoo account. The AppKey signs each request with an Ed25519 key that never leaves this machine.
+
+1. Make the key pair with OpenSSL 3 or newer (`brew install openssl@3`; macOS's own `openssl` is LibreSSL, which can't):
+   ```bash
+   mkdir -p ~/.config/financial-research && cd ~/.config/financial-research
+   OPENSSL="$(brew --prefix openssl@3)/bin/openssl"
+   "$OPENSSL" genpkey -algorithm ed25519 -out moomoo-ed25519.pem && chmod 600 moomoo-ed25519.pem
+   "$OPENSSL" pkey -in moomoo-ed25519.pem -pubout
+   ```
+2. At https://open.moomoo.com/dashboard?tab=app-keys, create an AppKey: a name of letters, digits and underscores; the market-data (quote) permission only, none of the trade ones; signature algorithm Ed25519; and the public key printed in step 1. Without an IP allowlist it expires after 30 days, so note the date.
+3. Save `~/.config/financial-research/moomoo.json` and `chmod 600` it:
+   ```json
+   {"app_key": "<the AppKey>", "private_key": "moomoo-ed25519.pem", "expires": "2027-01-31T12:00:00+08:00"}
+   ```
+   `private_key` is relative to the file's folder. `expires` is the date the dashboard shows; after it, `fin.py` stops using the key and says so. To keep the file elsewhere, set `MOOMOO_CONFIG` to its path.
+
+Don't paste the private key into a chat, a repository or a log.
+
 ## Across Asia
 
 - **Moomoo / Futu coverage** (the first block of `fin.py news`) varies by market:
@@ -24,7 +54,7 @@ Recipes below were verified in October 2026. Sites change: if one breaks, say so
 - **News language.** Search the local edition with the company's local name plus "share price" (股價 / 股价, 株価, 주가) via `fin.py news "<local name> 股價" --local`. Local outlets explain mid-cap moves that English wires skip. Use English for background and for wire coverage (Reuters, Bloomberg).
 - **Dual listings.** Compare the other line with `--vs`: A+H shares (`300750.SZ` / `3750.HK`), ADRs (`TSM` / `2330.TW`, `BABA` / `9988.HK`). A US line trades overnight, so it often moves first.
 - **Overnight read-through.** An Asian session follows the previous US session. Chip names track the US semiconductor ETF `SMH` and Nvidia, and exporters track the yen or won.
-- **Lunch breaks.** Singapore, Hong Kong, Japan and China pause at midday, and Yahoo's 5-minute data shows an empty gap. A filing at 12:00 (common in Hong Kong) moves the afternoon session.
+- **Lunch breaks.** Singapore, Hong Kong, Japan and China pause at midday, and the 5-minute data shows a gap. A filing at 12:00 (common in Hong Kong) moves the afternoon session.
 - **Google News.** It often gives only a date for Asian stories (`--:--` in `fin.py news`). Open the article for the real time. When tinyfish on a Google News link returns only a headline, fetch the `final_url` it reports.
 
 ## US
@@ -33,6 +63,7 @@ Recipes below were verified in October 2026. Sites change: if one breaks, say so
 - **Press releases** that aren't filed appear on the company's newsroom and on Business Wire, PR Newswire and GlobeNewswire.
 - **Readable with tinyfish:** Yahoo Finance, Motley Fool (also free call transcripts), CNBC, Investor's Business Daily, Forbes, Morningstar (Dow Jones wire).
 - **Mostly paywalled:** Bloomberg, WSJ, Barron's and FT. Their scoops get rewritten on the readable sites within hours.
+- **Binance perpetuals.** About 200 US stocks and ETFs (NVDA, TSLA, AAPL, SPY, QQQ and more) trade on Binance as perpetual futures, round the clock and on weekends, and so do a few Hong Kong names (`HK0700USDT` for Tencent, Xiaomi, Lenovo). `move` shows how the perpetual moved between the previous close and the open, with its steepest hour, which dates a gap to the hour, and what it did after the close. Its funding, open interest and long/short shares describe Binance traders, not the stock's holders.
 - **Calendars without a key:** the Nasdaq API has `https://api.nasdaq.com/api/calendar/earnings?date=YYYY-MM-DD` and `/api/analyst/<T>/ratings`. Send a browser User-Agent plus `Origin: https://www.nasdaq.com` and `Referer: https://www.nasdaq.com/`. Rating data is often sparse.
 
 ## Singapore (SGX)
@@ -62,7 +93,8 @@ Recipes below were verified in October 2026. Sites change: if one breaks, say so
   - EDINET's API needs a free key, and its web search needs a browser.
 - **Results timing.** 決算短信 (tanshin) mostly come out at 15:30, after the close, but 13:00–15:00 releases land during the session. Most fiscal years end in March.
 - **当社に関する一部報道について** ("regarding certain press reports about the company") is the company responding to a news story. It is a strong clue when explaining a move.
-- **Benchmarks.** Yahoo has no TOPIX index; add the TOPIX ETF `1306.T` with `--vs`.
+- **Benchmarks.** Add TOPIX with `--vs ^TOPX` (CNBC's index; Yahoo has none) or the TOPIX ETF `1306.T`.
+- **Prices.** CNBC lacks most Japanese stocks and moomoo has no Japanese data for international accounts, so prices come from Yahoo. When Yahoo is rate-limiting, `move` fails for them: take the day's numbers from a news report and say so.
 - **Price limits** are yen bands by price (e.g. ±¥700 for stocks priced ¥3,000–5,000) and widen after consecutive limit days.
 - **News:** `fin.py news "トヨタ 株価" --market jp --local`. Kabutan (株探) reads in full; Nikkei Asia is paywalled.
 
@@ -74,13 +106,14 @@ Recipes below were verified in October 2026. Sites change: if one breaks, say so
   - English filings: `englishdart.fss.or.kr`.
   - 잠정실적 = preliminary results. Samsung publishes them about a week after quarter end, before the open.
 - **Extended trading.** KRX after-hours runs 16:00–20:00, and the Nextrade venue trades in the evening. Evening news moves prices before the next regular open, so the "gap" may have happened the night before.
-- **Yahoo's intraday bars** for `.KS`/`.KQ` stop at 15:00. The daily close is correct.
+- **Prices.** `.KS` stocks come from CNBC, whose 5-minute bars include some after-hours trading. KOSDAQ (`.KQ`) stocks only come from Yahoo, whose intraday bars stop at 15:00.
 - **Market-wide stress:** look for KRX "sidecar" notices and widened futures limits on big index drops.
 - **News:** `fin.py news "삼성전자 주가" --market kr --local`. Yonhap and Korea Herald read in full from direct article URLs. Maeil Business, Hankyung and KED Global (English) are worth checking.
 
 ## Taiwan
 
 - **Announcements.** `fin.py filings` uses MOPS material information. Full text: POST the JSON parameters it prints to `https://mops.twse.com.tw/mops/api/t05st01_detail`. Financial-report PDFs come from `https://doc.twse.com.tw/server-java/t57sb01` (step=1, then step=9).
+- **Prices.** `.TW` stocks come from CNBC. TPEx (`.TWO`) stocks and their `006201.TWO` benchmark only come from Yahoo.
 - **Monthly revenue** comes out by the 10th of each month, and a revenue surprise can move a stock on its own. TSMC reports after the close, so its ADR trades first in New York.
 - **Holidays:** TWSE's calendar is `https://www.twse.com.tw/rwd/en/holidaySchedule/holidaySchedule?response=json`. Closed Mon 2026-10-26.
 - **News:** `fin.py news "台積電 股價" --market tw --local`. Focus Taiwan reads in full; DigiTimes gives teasers only. English "TSMC" searches are flooded with ADR filler.
@@ -90,7 +123,7 @@ Recipes below were verified in October 2026. Sites change: if one breaks, say so
 - **Announcements.** `fin.py filings` uses CNINFO, which covers both exchanges and links PDFs.
   - After-close filings are stamped 00:00 the next day; the reaction comes in the first session on or after that date.
   - Exact submission times: Shenzhen's `https://www.szse.cn/api/disc/announcement/annList` (POST JSON with `seDate`, `stock`, `channelCode: ["listedNotice_disc"]`), or Shanghai's `query.sse.com.cn` bulletin search, which needs `Referer: https://www.sse.com.cn/`.
-- **Benchmarks.** Yahoo's CSI 300, ChiNext and STAR indices lack daily history. Use the ETFs `510300.SS` (CSI 300), `159915.SZ` (ChiNext) and `588000.SS` (STAR 50) with `--vs`.
+- **Benchmarks.** `fin.py` has no CSI 300, ChiNext or STAR index. Use the ETFs `510300.SS` (CSI 300), `159915.SZ` (ChiNext) and `588000.SS` (STAR 50) with `--vs`.
 - **Hitting the limit.** A stock at its limit (涨停 / 跌停) can't trade further that day, so the move continues the next session.
 - **Abnormal-volatility notices.** A cumulative ±20% move over three days (±30% on ChiNext and STAR) forces a 异常波动公告.
 - **Deadlines:** Q1 and annual by 30 April, half-year by 31 August, Q3 by 31 October.
@@ -98,7 +131,7 @@ Recipes below were verified in October 2026. Sites change: if one breaks, say so
 
 ## India
 
-- **Prices.** Use `.NS` tickers. Yahoo's `.BO` history is broken for many large caps.
+- **Prices.** Use `.NS` tickers; CNBC has NSE prices. `.BO` tickers only come from Yahoo, whose BSE history is broken for many large caps.
 - **Announcements.** `fin.py filings` uses NSE.
   - BSE's API blocks scripts; its page `https://www.bseindia.com/stock-share-price/x/x/<scrip code>/corp-announcements/` reads with tinyfish.
   - Other NSE endpoints, same browser User-Agent: `/api/corporate-board-meetings?index=equities&symbol=` (results dates), `/api/corporates-corporateActions?index=equities&symbol=` (ex-dates), `/api/fiidiiTradeReact` (daily foreign and domestic institutional flows).
@@ -109,16 +142,18 @@ Recipes below were verified in October 2026. Sites change: if one breaks, say so
 ## Crypto (Binance)
 
 - **Prices.** Binance spot candles come from its market-data host (`data-api.binance.vision`, no key, not geo-blocked). Days are UTC and volume is in the quote currency. Pairs quoted in USDT, USDC or FDUSD can be written `BTCUSDT`; other quotes need a slash (`ETH/BTC`).
-- **Leverage.** `move` adds the USDⓈ-M perpetual's funding rate (per 8 hours; positive means longs pay shorts) and the change in open interest over the day. Binance keeps 30 days of open-interest history. How to read the combinations:
+- **Leverage.** `move` adds the USDⓈ-M perpetual's funding rate (paid every 8 hours for most coins, more often for some; positive means longs pay shorts), the change in open interest over the day, the share of accounts that are net long, the share of top traders' position size that is long, and the share of volume that takers bought. Binance keeps 30 days of open interest and positioning. How to read the combinations:
   - Price down, open interest down: longs closed or were liquidated.
   - Price down, open interest up: new shorts.
   - Price up, open interest up, funding high: leveraged longs piling in, which is fragile.
+  - Takers buying well under half the volume on a down day: sellers were hitting bids, not just buyers stepping away.
+  - More accounts long while top traders' long share falls: smaller accounts are buying what larger ones sell.
 
   Liquidation totals aren't in Binance's public API. Aggregators such as CoinGlass report them, but may need a browser.
 - **Announcements.** `filings` searches Binance's listing, delisting, maintenance, news and airdrop notices for the token, including futures contract names like `PREDICTUSDT`. For small coins, a listing or delisting notice is often the whole story.
-- **AI report.** `binance-ai` calls the undocumented endpoint behind the trade page's "Insights" panel: `POST https://www.binance.com/bapi/bigdata/v1/friendly/bigdata/search/ai-report/report` with `{"token": "BNB", "symbol": "BNBUSDT", "product": "web-spot", "lang": "en"}`.
-  - The report refreshes roughly hourly, and only the latest one is served.
-  - For a move days ago, it describes later conditions.
-  - When there's no report it returns `data: null` with HTTP 200.
+- **AI report.** `binance-ai` calls the undocumented endpoint behind the trade page's "Insights" panel: `POST https://www.binance.com/bapi/bigdata/v3/friendly/bigdata/search/ai-report/report` with `{"token": "BNB", "symbol": "BNBUSDT", "product": "web-spot", "lang": "en", "timestamp": "<ms>", "version": "v4"}`.
+  - The report is rebuilt about hourly. `timestamp` picks the one current at that moment, back about 90 days, and `--at` sets it.
+  - For a move days ago, read the report from that hour: today's describes later conditions.
+  - When there's no report it answers HTTP 200 with no modules.
   - If the endpoint stops working, the panel is still visible on `https://www.binance.com/en/trade/<BASE>_<QUOTE>?type=spot`.
 - **News.** Moomoo covers the large coins. CoinDesk, The Block, Decrypt and Cointelegraph appear in the other-outlets block. On macro-driven days compare with the Nasdaq (`--vs ^IXIC`). Dates only line up roughly, because the US session ends at 20:00–21:00 UTC. Moneycontrol is partial through tinyfish; plain curl has the full text in the page's JSON-LD `articleBody`. Also Mint, Business Standard and Reuters.
